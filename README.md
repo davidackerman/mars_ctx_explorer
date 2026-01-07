@@ -2,6 +2,10 @@
 
 AI/ML-based detection of life-like signatures from Mars rover data using deep learning on WATSON micro-imager textures.
 
+**Author**: David Ackerman
+
+**Current Status**: Image acquisition pipeline implemented. The project currently includes tools for downloading and converting Mars rover images from NASA's Planetary Data System. Machine learning model training and biosignature detection features are planned for future development.
+
 ## Overview
 
 This repository implements a PyTorch-based pipeline for detecting biosignature-proxy anomalies in Mars Perseverance rover imagery. Starting with WATSON micro-imager texture analysis, the system can identify patterns like:
@@ -33,7 +37,7 @@ The approach uses deep learning to scan thousands of Mars rover images and ident
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/mars_astrobio.git
+git clone https://github.com/davidackerman/mars_astrobio.git
 cd mars_astrobio
 
 # Install dependencies with Pixi
@@ -170,7 +174,7 @@ pytest --cov=mars_biosig --cov-report=html
 ## Roadmap
 
 - [x] Phase 1: Foundation - Repository structure and configuration
-- [ ] Phase 2: Data Pipeline - PDS client and WATSON downloader
+- [x] Phase 2: Data Pipeline - PDS client and WATSON downloader (**Currently Complete**)
 - [ ] Phase 3: Model Architecture - Texture CNN baseline
 - [ ] Phase 4: Training Pipeline - Training loop and evaluation
 - [ ] Phase 5: Inference & Analysis - Mission-wide scanning
@@ -187,9 +191,9 @@ If you use this code in your research, please cite:
 ```bibtex
 @software{mars_biosig2025,
   title = {Mars Rover Biosignature Detection},
-  author = {Ackerman, Daniel},
+  author = {Ackerman, David},
   year = {2025},
-  url = {https://github.com/yourusername/mars_astrobio}
+  url = {https://github.com/davidackerman/mars_astrobio}
 }
 ```
 
