@@ -53,6 +53,16 @@ pixi shell
 # Download WATSON data for first 100 sols
 pixi run download-watson
 
+# OR: Download full mission browse images from PDS Atlas (RECOMMENDED!)
+# First get the curl script from https://pds-imaging.jpl.nasa.gov/beta/cart
+# Then download biosignature sites (fastest way to get started):
+pixi run download-cheyava   # Cheyava Falls (sols 1200-1220)
+pixi run download-wildcat   # Wildcat Ridge (sols 490-510)
+pixi run download-biosig    # Both sites combined
+
+# Or download everything (all ~296k images, takes 10-15 hours):
+pixi run download-atlas
+
 # Prepare dataset (split into train/val/test)
 pixi run prepare-data
 
@@ -65,6 +75,8 @@ python scripts/predict.py --checkpoint models/production/watson_texture_v1.pt
 # Explore results in Jupyter notebooks
 pixi run notebook
 ```
+
+See [DOWNLOAD_COMPARISON.md](DOWNLOAD_COMPARISON.md) for details on the different download methods.
 
 ## Project Structure
 

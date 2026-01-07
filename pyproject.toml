@@ -93,6 +93,10 @@ prod = {solve-group = "default"}
 # Pixi tasks (command shortcuts)
 [tool.pixi.tasks]
 download-watson = "python scripts/download_data.py --instrument watson --sols 0-100"
+download-atlas = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8"
+download-cheyava = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols cheyava"
+download-wildcat = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols wildcat"
+download-biosig = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols biosig"
 prepare-data = "python scripts/prepare_dataset.py"
 train = "python scripts/train.py --config configs/experiments/exp001_watson_baseline.yaml"
 test = "pytest tests/ -v --cov=mars_biosig"

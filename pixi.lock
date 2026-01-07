@@ -2080,7 +2080,7 @@ packages:
 - pypi: .
   name: mars-biosig
   version: 0.1.0
-  sha256: 7024221c725dfe7dacbb6ad27f0973d8092cabdb735e8f8dcb5b560b084fcac7
+  sha256: 50675fc74cb9f4af1e9e38b985ad00dee5449263b0412954ffd73ed860fb2866
   requires_dist:
   - torch>=2.5.0
   - torchvision>=0.20.0

@@ -111,6 +111,12 @@ test_conversion.py
 check_png.py
 check_converted.py
 
+# Test and debug files
+*.png
+*.bat
+debug_*.py
+test_*.py
+
 # OS
 .DS_Store
 Thumbs.db
