@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = {text = "BSD-3-Clause"}
 authors = [
-    {name = "Daniel Ackerman", email = "ackermand@hhmi.org"}
+    {name = "David Ackerman", email = "ackermand@hhmi.org"}
 ]
 keywords = ["mars", "astrobiology", "biosignatures", "machine-learning", "pytorch", "perseverance"]
 classifiers = [
@@ -46,8 +46,8 @@ dependencies = [
 # Optional dependency groups (managed by Pixi - see tool.pixi.feature sections)
 
 [project.urls]
-Repository = "https://github.com/yourusername/mars_astrobio"
-Issues = "https://github.com/yourusername/mars_astrobio/issues"
+Repository = "https://github.com/davidackerman/mars_astrobio"
+Issues = "https://github.com/davidackerman/mars_astrobio/issues"
 
 [project.scripts]
 mars-biosig-download = "mars_biosig.scripts.download_data:main"
