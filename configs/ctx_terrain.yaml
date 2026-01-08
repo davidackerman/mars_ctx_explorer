@@ -1,0 +1,46 @@
+# CTX Terrain Classification Pipeline Configuration
+
+pipeline_name: "ctx_terrain_classification"
+output_dir: "outputs/ctx_terrain"
+
+# Optional: Directory containing CTX images (can be overridden by --images argument)
+# image_dir: "data/raw/ctx"
+
+# Tiling parameters
+tiling:
+  tile_size: 256          # Size of square tiles
+  overlap: 0              # Overlap between tiles (0 = no overlap)
+  min_contrast_std: 10.0  # Minimum std dev for contrast (skip uniform tiles)
+  min_data_fraction: 0.9  # Minimum fraction of valid (non-NoData) pixels
+  nodata_value: 0         # Value representing NoData pixels
+
+# DINOv3 embedding extraction
+embedding:
+  model_name: "dinov3_vitb14"  # 768-dim embeddings (RECOMMENDED)
+  # Alternatives: dinov3_vits14 (384-dim), dinov3_vitl14 (1024-dim), dinov3_vitg14 (1536-dim)
+  device: "cuda"               # 'cuda' or 'cpu'
+  use_half_precision: false    # Use FP16 (faster, requires CUDA)
+
+# Embedding pipeline parameters
+embedding_pipeline:
+  output_format: "parquet"  # 'parquet' (recommended) or 'npy'
+  batch_size: 256           # Batch size for embedding extraction
+  num_workers: 8            # Number of parallel data loaders
+
+# HDBSCAN clustering
+clustering:
+  min_cluster_size: 100  # Minimum tiles per cluster (~0.5-1% of dataset)
+  min_samples: 10        # Neighborhood size for core points
+  metric: "euclidean"    # Distance metric
+  cluster_selection_epsilon: 0.0  # Cluster merging threshold (0.0 = auto)
+
+# Novelty detection
+novelty:
+  method: "knn"  # 'knn' (recommended), 'lof', 'centroid', 'iforest'
+  k: 10          # Number of nearest neighbors (for knn method)
+  use_faiss: true  # Use FAISS for fast kNN (recommended for large datasets)
+
+# Gallery generation
+gallery:
+  top_k_per_cluster: 20  # Number of representative tiles per cluster
+  top_n_outliers: 100    # Number of top novelty outliers to identify
