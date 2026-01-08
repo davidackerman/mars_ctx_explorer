@@ -1,4 +1,4 @@
-"""DINOv2/v3 Vision Transformer embedding extractor."""
+"""DINOv3 Vision Transformer embedding extractor."""
 
 import logging
 from typing import Optional
@@ -11,30 +11,31 @@ from .base import EmbeddingExtractor
 logger = logging.getLogger(__name__)
 
 
-class DINOv2Extractor(EmbeddingExtractor):
+class DINOv3Extractor(EmbeddingExtractor):
     """
-    DINOv2/v3 Vision Transformer for embedding extraction.
+    DINOv3 Vision Transformer for embedding extraction.
 
-    DINOv2 is a self-supervised ViT trained on ImageNet-22k and additional curated
+    DINOv3 is a self-supervised ViT trained on ImageNet-22k and additional curated
     datasets. It produces high-quality visual embeddings suitable for unsupervised
     clustering and retrieval tasks.
 
-    Note: This class supports both DINOv2 and DINOv3 models (DINOv3 is recommended).
+    This class supports both DINOv2 and DINOv3 models, with DINOv3 as the recommended
+    default for best performance.
 
     Supported model variants:
-    - dinov2_vits14: Small (21M params, 384-dim embeddings)
-    - dinov2_vitb14: Base (86M params, 768-dim embeddings) [RECOMMENDED for DINOv2]
-    - dinov2_vitl14: Large (300M params, 1024-dim embeddings)
-    - dinov2_vitg14: Giant (1.1B params, 1536-dim embeddings)
+    - dinov3_vits14: Small (21M params, 384-dim embeddings)
+    - dinov3_vitb14: Base (86M params, 768-dim embeddings) [RECOMMENDED]
+    - dinov3_vitl14: Large (300M params, 1024-dim embeddings)
+    - dinov3_vitg14: Giant (1.1B params, 1536-dim embeddings)
 
-    For DINOv3, use the facebookresearch/dinov3 repo:
-    - dinov3_vits14, dinov3_vitb14, dinov3_vitl14, dinov3_vitg14
+    Also supports legacy DINOv2 models:
+    - dinov2_vits14, dinov2_vitb14, dinov2_vitl14, dinov2_vitg14
 
     Args:
-        model_name: DINO model variant name (dinov2_* or dinov3_*)
+        model_name: DINO model variant name (dinov3_* or dinov2_*)
         device: Device to run inference on ('cuda' or 'cpu')
         use_half_precision: Use FP16 for faster inference (requires CUDA)
-        repo: Torch hub repository ('facebookresearch/dinov2' or 'facebookresearch/dinov3')
+        repo: Torch hub repository ('facebookresearch/dinov3' or 'facebookresearch/dinov2')
     """
 
     MODEL_DIMS = {
@@ -126,7 +127,7 @@ class DINOv2Extractor(EmbeddingExtractor):
     @staticmethod
     def get_default_transforms():
         """
-        Get default image preprocessing transforms for DINOv2.
+        Get default image preprocessing transforms for DINOv3.
 
         Returns:
             torchvision.transforms composition for image preprocessing
