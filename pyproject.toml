@@ -3,16 +3,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "mars-biosig"
-version = "0.1.0"
-description = "AI/ML-based detection of biosignature-proxy anomalies from Mars rover data"
+name = "scientific-pipelines"
+version = "0.2.0"
+description = "Multi-domain unsupervised ML pipelines for planetary and astronomical data analysis"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = {text = "BSD-3-Clause"}
 authors = [
     {name = "David Ackerman", email = "ackermand@hhmi.org"}
 ]
-keywords = ["mars", "astrobiology", "biosignatures", "machine-learning", "pytorch", "perseverance"]
+keywords = ["mars", "astronomy", "unsupervised-learning", "clustering", "machine-learning", "pytorch", "ctx", "wise", "brown-dwarfs"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -41,6 +41,13 @@ dependencies = [
     "xmltodict>=0.13.0",
     "python-dotenv>=1.0.0",
     "beautifulsoup4>=4.12.0",
+    # New dependencies for multi-domain pipelines
+    "hdbscan>=0.8.33",        # HDBSCAN clustering
+    "umap-learn>=0.5.5",      # UMAP dimensionality reduction
+    "timm>=0.9.0",            # PyTorch Image Models (for DINOv2)
+    "panoptes-client>=1.6.0", # Zooniverse Panoptes API
+    "pyarrow>=14.0.0",        # Parquet file support
+    "faiss-cpu>=1.7.4",       # Fast kNN for novelty detection
 ]
 
 # Optional dependency groups (managed by Pixi - see tool.pixi.feature sections)
@@ -50,9 +57,13 @@ Repository = "https://github.com/davidackerman/mars_astrobio"
 Issues = "https://github.com/davidackerman/mars_astrobio/issues"
 
 [project.scripts]
-mars-biosig-download = "mars_biosig.scripts.download_data:main"
-mars-biosig-train = "mars_biosig.scripts.train:main"
-mars-biosig-predict = "mars_biosig.scripts.predict:main"
+# Backward compatibility - original WATSON scripts
+mars-biosig-download = "scientific_pipelines.planetary.mars.watson.scripts:download_main"
+mars-biosig-train = "scientific_pipelines.planetary.mars.watson.scripts:train_main"
+mars-biosig-predict = "scientific_pipelines.planetary.mars.watson.scripts:predict_main"
+# New multi-domain pipeline scripts
+ctx-terrain-pipeline = "scientific_pipelines.planetary.mars.ctx.scripts:run_pipeline"
+backyard-worlds-pipeline = "scientific_pipelines.astronomy.backyard_worlds.scripts:run_pipeline"
 
 # Pixi configuration
 [tool.pixi.project]
@@ -67,7 +78,7 @@ torchvision = ">=0.15.0"
 
 # PyPI dependencies auto-read from [project.dependencies]
 [tool.pixi.pypi-dependencies]
-mars-biosig = { path = ".", editable = true }
+scientific-pipelines = { path = ".", editable = true }
 
 # Development environment with extras
 [tool.pixi.feature.dev.pypi-dependencies]
@@ -99,11 +110,14 @@ download-wildcat = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-
 download-biosig = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols biosig"
 prepare-data = "python scripts/prepare_dataset.py"
 train = "python scripts/train.py --config configs/experiments/exp001_watson_baseline.yaml"
-test = "pytest tests/ -v --cov=mars_biosig"
+test = "pytest tests/ -v --cov=scientific_pipelines"
 lint = "ruff check src/ tests/"
 format = "black src/ tests/ scripts/"
 typecheck = "mypy src/"
 notebook = "jupyter lab notebooks/"
+# New pipeline tasks
+ctx-pipeline = "ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml"
+backyard-worlds = "backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml"
 
 # Tool-specific configurations
 [tool.black]
@@ -121,7 +135,7 @@ lint.ignore = ["E203", "E501"]
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
-addopts = "-v --cov=mars_biosig --cov-report=html --cov-report=term"
+addopts = "-v --cov=scientific_pipelines --cov-report=html --cov-report=term"
 
 [tool.mypy]
 python_version = "3.10"
@@ -131,4 +145,4 @@ disallow_untyped_defs = false
 ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/mars_biosig"]
+packages = ["src/scientific_pipelines"]
