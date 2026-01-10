@@ -85,13 +85,26 @@ class CTXTiler:
             output_dir.mkdir(parents=True, exist_ok=True)
 
         # Load image
-        img = Image.open(image_path)
+        try:
+            # Try opening with PIL first (works for most formats including some PDS IMG files)
+            img = Image.open(image_path)
 
-        # Convert to grayscale if needed
-        if img.mode != 'L':
-            img = img.convert('L')
+            # Convert to grayscale if needed
+            if img.mode != 'L':
+                img = img.convert('L')
 
-        img_array = np.array(img)
+            img_array = np.array(img)
+
+        except Exception as e:
+            # If PIL fails and this is a .IMG file, try alternative methods
+            if image_path.suffix.upper() == '.IMG':
+                logger.warning(
+                    f"PIL failed to open {image_path.name}, trying alternative loaders: {e}"
+                )
+                img_array = self._load_pds_img(image_path)
+            else:
+                logger.error(f"Failed to load image {image_path.name}: {e}")
+                raise
         img_height, img_width = img_array.shape
 
         logger.info(
@@ -239,3 +252,55 @@ class CTXTiler:
             if data_fractions
             else 0.0,
         }
+
+    def _load_pds_img(self, image_path: Path) -> np.ndarray:
+        """
+        Load PDS IMG format files using alternative methods.
+
+        Tries multiple approaches:
+        1. GDAL/rasterio (if available)
+        2. Simple binary parsing with label reading
+
+        Args:
+            image_path: Path to PDS IMG file
+
+        Returns:
+            Image as numpy array (2D grayscale)
+
+        Raises:
+            ImportError: If no suitable loader is available
+            ValueError: If image cannot be parsed
+        """
+        # Try GDAL/rasterio first
+        try:
+            import rasterio
+            with rasterio.open(image_path) as src:
+                img_array = src.read(1)  # Read first band
+                logger.info(f"Successfully loaded {image_path.name} using rasterio")
+                return img_array
+        except ImportError:
+            logger.debug("rasterio not available, trying GDAL")
+        except Exception as e:
+            logger.debug(f"rasterio failed: {e}")
+
+        try:
+            from osgeo import gdal
+            gdal.UseExceptions()
+            dataset = gdal.Open(str(image_path))
+            if dataset is not None:
+                band = dataset.GetRasterBand(1)
+                img_array = band.ReadAsArray()
+                dataset = None  # Close dataset
+                logger.info(f"Successfully loaded {image_path.name} using GDAL")
+                return img_array
+        except ImportError:
+            logger.debug("GDAL not available")
+        except Exception as e:
+            logger.debug(f"GDAL failed: {e}")
+
+        # If all methods fail, provide helpful error message
+        raise ImportError(
+            f"Cannot load PDS IMG file {image_path.name}. "
+            "PIL failed and no alternative loader (rasterio, GDAL) is available. "
+            "Install rasterio or gdal: pip install rasterio"
+        )

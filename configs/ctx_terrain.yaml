@@ -6,6 +6,35 @@ output_dir: "outputs/ctx_terrain"
 # Optional: Directory containing CTX images (can be overridden by --images argument)
 # image_dir: "data/raw/ctx"
 
+# CTX data download (optional - only used with --download flag)
+download:
+  output_dir: "data/raw/ctx"          # Where to save downloaded images
+  api_base_url: "https://oderest.rsl.wustl.edu/live2/"
+  max_results: 50                      # Maximum images to download (~7.5 GB)
+
+  # ISIS3 processing pipeline (recommended for proper geometric correction)
+  # Corrects spacecraft geometry so craters appear circular instead of elliptical
+  isis3:
+    enabled: true                     # Use ISIS3 pipeline (mroctx2isis→spiceinit→ctxcal→cam2map→isis2std)
+    apply_calibration: true           # Apply radiometric calibration (ctxcal)
+    map_projection: "sinusoidal"      # Map projection: sinusoidal, equirectangular, polarstereographic
+    map_resolution: null              # Resolution in m/pixel (null = auto, ~6 m/pixel native)
+
+  # Optional: Filter by geographic region (longitude/latitude bounds)
+  # Uncomment to download specific regions
+  # region:
+  #   min_lon: -77.5    # Western longitude (degrees)
+  #   max_lon: -77.0    # Eastern longitude (degrees)
+  #   min_lat: 18.0     # Southern latitude (degrees)
+  #   max_lat: 18.5     # Northern latitude (degrees)
+
+  # Optional: Filter by image quality
+  # quality:
+  #   max_emission_angle: 45    # Maximum viewing angle (degrees)
+  #   max_incidence_angle: 75   # Maximum sun angle (degrees)
+  #   min_resolution: 5.0       # Minimum resolution (m/pixel)
+  #   max_resolution: 7.0       # Maximum resolution (m/pixel)
+
 # Tiling parameters
 tiling:
   tile_size: 256          # Size of square tiles
