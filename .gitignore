@@ -1,4 +1,5 @@
 # Python
+outputs/
 isis3data/
 __pycache__/
 *.py[cod]
