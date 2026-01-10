@@ -1,4 +1,5 @@
 # Python
+isis3data/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -35,6 +36,7 @@ env.bak/
 venv.bak/
 
 # IDEs
+data/*
 .vscode/
 .idea/
 *.swp

@@ -78,9 +78,8 @@ pixi install
 # Activate environment
 pixi shell
 
-# Set up NASA API key in .env file
+# Set up NASA API key in .env file (optional, for legacy WATSON pipeline)
 # Open .env and add: NASA_API_KEY=your_actual_key_here
-# See SETUP_API_KEY.md for detailed instructions
 ```
 
 ### Usage
@@ -169,7 +168,6 @@ scientific_pipelines/
 └── models/                    # Trained models (gitignored)
 ```
 
-See [the implementation plan](/.claude/plans/delegated-jumping-cray.md) for detailed architecture documentation.
 
 ## Scientific Background
 

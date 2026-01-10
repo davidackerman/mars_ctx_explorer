@@ -27,7 +27,8 @@ classifiers = [
 dependencies = [
     "torch>=2.5.0",
     "torchvision>=0.20.0",
-    "numpy>=1.26.0",
+    "torchmetrics>=1.0.0",
+    "numpy>=1.26.0,<2.4",
     "pillow>=10.0.0",
     "requests>=2.31.0",
     "pyyaml>=6.0",
@@ -48,6 +49,8 @@ dependencies = [
     "panoptes-client>=1.6.0", # Zooniverse Panoptes API
     "pyarrow>=14.0.0",        # Parquet file support
     "faiss-cpu>=1.7.4",       # Fast kNN for novelty detection
+    "numba>=0.59.0",          # JIT compiler (required for UMAP, needs 0.59+ for Python 3.12+)
+    "termcolor>=2.0.0",       # Colored terminal output (required by DINOv3)
 ]
 
 # Optional dependency groups (managed by Pixi - see tool.pixi.feature sections)
@@ -57,11 +60,7 @@ Repository = "https://github.com/davidackerman/mars_astrobio"
 Issues = "https://github.com/davidackerman/mars_astrobio/issues"
 
 [project.scripts]
-# Backward compatibility - original WATSON scripts
-mars-biosig-download = "scientific_pipelines.planetary.mars.watson.scripts:download_main"
-mars-biosig-train = "scientific_pipelines.planetary.mars.watson.scripts:train_main"
-mars-biosig-predict = "scientific_pipelines.planetary.mars.watson.scripts:predict_main"
-# New multi-domain pipeline scripts
+# Multi-domain pipeline scripts
 ctx-terrain-pipeline = "scientific_pipelines.planetary.mars.ctx.scripts:run_pipeline"
 backyard-worlds-pipeline = "scientific_pipelines.astronomy.backyard_worlds.scripts:run_pipeline"
 
@@ -72,9 +71,13 @@ platforms = ["linux-64"]
 
 # Pixi dependencies (conda packages)
 [tool.pixi.dependencies]
-python = ">=3.10,<3.13"
+python = "3.12.*"
 pytorch = ">=2.0.0"
 torchvision = ">=0.15.0"
+numpy = ">=1.26.0,<2.4"
+gdal = ">=3.8.0"
+# Note: ISIS3 has dependency conflicts with Python 3.12
+# Install it in a separate conda environment (see ISIS3_SETUP.md)
 
 # PyPI dependencies auto-read from [project.dependencies]
 [tool.pixi.pypi-dependencies]
@@ -103,19 +106,13 @@ prod = {solve-group = "default"}
 
 # Pixi tasks (command shortcuts)
 [tool.pixi.tasks]
-download-watson = "python scripts/download_data.py --instrument watson --sols 0-100"
-download-atlas = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8"
-download-cheyava = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols cheyava"
-download-wildcat = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols wildcat"
-download-biosig = "python scripts/download_pds_atlas.py pdsimg-atlas-curl_2026-01-06T01_11_53_944.bat data/raw/watson_browse 8 --sols biosig"
-prepare-data = "python scripts/prepare_dataset.py"
-train = "python scripts/train.py --config configs/experiments/exp001_watson_baseline.yaml"
+# Development tasks
 test = "pytest tests/ -v --cov=scientific_pipelines"
 lint = "ruff check src/ tests/"
-format = "black src/ tests/ scripts/"
+format = "black src/ tests/"
 typecheck = "mypy src/"
 notebook = "jupyter lab notebooks/"
-# New pipeline tasks
+# Pipeline tasks
 ctx-pipeline = "ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml"
 backyard-worlds = "backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml"
 
