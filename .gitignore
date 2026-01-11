@@ -37,7 +37,7 @@ env.bak/
 venv.bak/
 
 # IDEs
-data/*
+data/backyard_worlds/subjects/
 .vscode/
 .idea/
 *.swp
