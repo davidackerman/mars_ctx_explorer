@@ -51,6 +51,13 @@ Fully automated AI for ranking brown dwarf candidates in WISE infrared flipbook 
 - **Brown Dwarf Scoring**: Multi-factor heuristics (motion, morphology, color, novelty)
 - **Behavior Clustering**: Automatic classification of object types
 
+### Backyard Worlds Temporal Detector (Ground Truth Training)
+
+Train a small supervised detector on labeled flipbooks (mover/dipole) using one of three model variants:
+- **temporal**: 2D ResNet18 per frame + 3D temporal fusion (default)
+- **framestack**: stack 4 frames into 12 channels for a 2D CNN
+- **diff**: use frame differences (t1-t0, t2-t1, t3-t2) as 9-channel input
+
 ### Production Ready
 - **Pixi-managed dependencies**: Reproducible environments
 - **Comprehensive logging**: Track pipeline progress
@@ -125,6 +132,23 @@ backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml --skip-
 - `embeddings.parquet` - 2304-dim sequence embeddings
 - `subject_clusters.csv` - Behavior cluster assignments
 - `brown_dwarf_ranking.csv` - Ranked candidates by score
+
+#### Backyard Worlds Temporal Detector Training
+
+```bash
+# Default temporal model
+pixi run python scripts/train_temporal_detector.py --model temporal
+
+# Frame-stack 2D CNN
+pixi run python scripts/train_temporal_detector.py --model framestack
+
+# Difference-stream 2D CNN
+pixi run python scripts/train_temporal_detector.py --model diff
+```
+
+Logs and checkpoints are grouped by model type:
+- `logs/temporal_detector/<model>/<model>_run_YYYYMMDD_HHMMSS/`
+- `checkpoints/temporal_detector/<model>/<model>_run_YYYYMMDD_HHMMSS/`
 
 #### Legacy WATSON Pipeline
 
