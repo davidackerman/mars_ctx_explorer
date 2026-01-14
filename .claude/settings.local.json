@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /mnt/bigdisk/Programming/mars_astrobio log --oneline -20)",
+      "Bash(identify:*)",
+      "Bash(sort:*)",
+      "Bash(python scripts/prepare_ground_truth_training.py:*)",
+      "Bash(python3:*)",
+      "Bash(pixi run:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(python:*)",
+      "Bash(timeout 300 pixi run python:*)",
+      "Bash(pixi install:*)",
+      "Bash(tee:*)",
+      "Bash(nvidia-smi:*)"
+    ]
+  }
+}
