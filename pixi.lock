@@ -95,6 +95,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/icu-78.1-h33c6efd_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/idna-3.11-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/imageio-2.37.0-pyhfb79c49_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/imath-3.2.2-hde8ca8f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/importlib-metadata-8.7.0-pyhe01879c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/intel-gmmlib-22.9.0-hb700be7_0.conda
@@ -507,6 +508,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/icu-78.1-h33c6efd_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/idna-3.11-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/imageio-2.37.0-pyhfb79c49_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/imath-3.2.2-hde8ca8f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/importlib-metadata-8.7.0-pyhe01879c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/intel-gmmlib-22.9.0-hb700be7_0.conda
@@ -999,6 +1001,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/icu-78.1-h33c6efd_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/idna-3.11-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/imageio-2.37.0-pyhfb79c49_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/imath-3.2.2-hde8ca8f_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/importlib-metadata-8.7.0-pyhe01879c_1.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/intel-gmmlib-22.9.0-hb700be7_0.conda
@@ -1807,8 +1810,6 @@ packages:
   - liblapack 3.9.0 16_linux64_mkl
   - liblapacke 3.9.0 16_linux64_mkl
   - llvm-openmp >=14.0.4
-  arch: x86_64
-  platform: linux
   license: BSD-3-Clause
   license_family: BSD
   purls: []
@@ -1825,8 +1826,6 @@ packages:
   - liblapacke 3.9.0 16_linux64_mkl
   - mkl >=2022.1.0,<2023.0a0
   - mkl-devel 2022.1.*
-  arch: x86_64
-  platform: linux
   license: BSD-3-Clause
   license_family: BSD
   purls: []
@@ -2041,8 +2040,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 22563
@@ -2064,8 +2061,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 1918773
@@ -2087,8 +2082,6 @@ packages:
   - libnvfatbin 12.4.127.*
   - libnvjitlink 12.4.127.*
   - libnvjpeg 12.3.1.117.*
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 20180
@@ -2101,8 +2094,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 18825627
@@ -2115,8 +2106,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 31691
@@ -2130,8 +2119,6 @@ packages:
   - libgcc-ng >=12
   - libstdcxx-ng >=12
   - ocl-icd >=2.3.2,<3.0a0
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 30406
@@ -2886,6 +2873,19 @@ packages:
   - pkg:pypi/idna?source=hash-mapping
   size: 50721
   timestamp: 1760286526795
+- conda: https://conda.anaconda.org/conda-forge/noarch/imageio-2.37.0-pyhfb79c49_0.conda
+  sha256: 8ef69fa00c68fad34a3b7b260ea774fda9bd9274fd706d3baffb9519fd0063fe
+  md5: b5577bc2212219566578fd5af9993af6
+  depends:
+  - numpy
+  - pillow >=8.3.2
+  - python >=3.9
+  license: BSD-2-Clause
+  license_family: BSD
+  purls:
+  - pkg:pypi/imageio?source=hash-mapping
+  size: 293226
+  timestamp: 1738273949742
 - conda: https://conda.anaconda.org/conda-forge/linux-64/imath-3.2.2-hde8ca8f_0.conda
   sha256: 43f30e6fd8cbe1fef59da760d1847c9ceff3fb69ceee7fd4a34538b0927959dd
   md5: c427448c6f3972c76e8a4474e0fe367b
@@ -3777,8 +3777,6 @@ packages:
   - libcblas 3.9.0 16_linux64_mkl
   - blas * mkl
   - mkl <2025
-  arch: x86_64
-  platform: linux
   track_features:
   - blas_mkl blas_backport_2
   license: BSD-3-Clause
@@ -3844,8 +3842,6 @@ packages:
   - liblapacke 3.9.0 16_linux64_mkl
   - blas * mkl
   - mkl <2025
-  arch: x86_64
-  platform: linux
   track_features:
   - blas_mkl
   license: BSD-3-Clause
@@ -3899,8 +3895,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 240665617
@@ -3913,8 +3907,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 174980358
@@ -3927,8 +3919,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 924329
@@ -3955,8 +3945,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 41590169
@@ -3989,8 +3977,6 @@ packages:
   - libgcc-ng >=12
   - libnvjitlink >=12.4.127,<13.0.0a0
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 81594879
@@ -4004,8 +3990,6 @@ packages:
   - libgcc-ng >=12
   - libnvjitlink >=12.4.127,<13.0.0a0
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 117818451
@@ -4221,8 +4205,6 @@ packages:
   md5: e5eb2ddedabd0063e442f230755d2062
   depends:
   - libgfortran 15.2.0 h69a702a_16
-  arch: x86_64
-  platform: linux
   license: GPL-3.0-only WITH GCC-exception-3.1
   license_family: GPL
   purls: []
@@ -4448,8 +4430,6 @@ packages:
   - liblapacke 3.9.0 16_linux64_mkl
   - libcblas 3.9.0 16_linux64_mkl
   - mkl <2025
-  arch: x86_64
-  platform: linux
   track_features:
   - blas_mkl
   license: BSD-3-Clause
@@ -4468,8 +4448,6 @@ packages:
   constrains:
   - blas * mkl
   - mkl <2025
-  arch: x86_64
-  platform: linux
   track_features:
   - blas_mkl
   license: BSD-3-Clause
@@ -4530,8 +4508,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 99461229
@@ -4565,8 +4541,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 792025
@@ -4579,8 +4553,6 @@ packages:
   - cuda-version>=12.0.0,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 16571958
@@ -4593,8 +4565,6 @@ packages:
   - cuda-version >=12.4,<12.5.0a0
   - libgcc-ng >=12
   - libstdcxx-ng >=12
-  arch: x86_64
-  platform: linux
   license: LicenseRef-NVIDIA-End-User-License-Agreement
   purls: []
   size: 2491500
@@ -5415,8 +5385,6 @@ packages:
   - libzlib >=1.2.13,<2.0.0a0
   constrains:
   - openmp 15.0.7|15.0.7.*
-  arch: x86_64
-  platform: linux
   license: Apache-2.0 WITH LLVM-exception
   license_family: APACHE
   purls: []
@@ -5545,8 +5513,6 @@ packages:
   - _openmp_mutex >=4.5
   - llvm-openmp >=14.0.3
   - tbb 2021.*
-  arch: x86_64
-  platform: linux
   license: LicenseRef-ProprietaryIntel
   license_family: Proprietary
   purls: []
@@ -5558,8 +5524,6 @@ packages:
   depends:
   - mkl 2022.1.0 h84fe81f_915
   - mkl-include 2022.1.0 h84fe81f_915
-  arch: x86_64
-  platform: linux
   license: LicenseRef-ProprietaryIntel
   license_family: Proprietary
   purls: []
@@ -5568,8 +5532,6 @@ packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/mkl-include-2022.1.0-h84fe81f_915.tar.bz2
   sha256: 63415fe64e99f8323d0191d45ea5b1ec3973317e728b9071267ffb7ff3b38364
   md5: 2dcd1acca05c11410d4494d7fc7dfa2a
-  arch: x86_64
-  platform: linux
   license: LicenseRef-ProprietaryIntel
   license_family: Proprietary
   purls: []
@@ -6751,8 +6713,6 @@ packages:
   - typing_extensions
   constrains:
   - cpuonly <0
-  arch: x86_64
-  platform: linux
   license: BSD 3-Clause
   license_family: BSD
   purls:
@@ -6776,8 +6736,6 @@ packages:
   - libnpp >=12.2.5.30,<12.3.0.116
   - libnvjitlink >=12.4.127,<12.5.40
   - libnvjpeg >=12.3.1.117,<12.3.2.38
-  arch: x86_64
-  platform: linux
   purls: []
   size: 7189
   timestamp: 1724179791784
@@ -7026,7 +6984,7 @@ packages:
 - pypi: .
   name: scientific-pipelines
   version: 0.2.0
-  sha256: 3e112881f85a2c9ad167c8d4cf79ae67648a97361302d28ad6dec9a429f8d5c1
+  sha256: ce7ff88c4adfc01149a3fa50942c851e216694dc77f4552a37cf2d475c7ca039
   requires_dist:
   - torch>=2.0.0
   - torchvision>=0.15.0
@@ -7417,8 +7375,6 @@ packages:
   - libgcc >=14
   - libhwloc >=2.12.2,<2.12.3.0a0
   - libstdcxx >=14
-  arch: x86_64
-  platform: linux
   license: Apache-2.0
   license_family: APACHE
   purls: []
@@ -7685,8 +7641,6 @@ packages:
   - filelock
   - python >=3.12,<3.13.0a0
   - pytorch
-  arch: x86_64
-  platform: linux
   license: MIT
   purls:
   - pkg:pypi/triton?source=hash-mapping
@@ -7709,8 +7663,6 @@ packages:
   - requests
   constrains:
   - cpuonly <0
-  arch: x86_64
-  platform: linux
   license: BSD
   purls:
   - pkg:pypi/torchvision?source=hash-mapping

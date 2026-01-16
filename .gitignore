@@ -40,7 +40,7 @@ venv.bak/
 
 # IDEs
 data/backyard_worlds/subjects/
-data/backyard_worlds/synthetic_ground_truth/
+data/backyard_worlds/synthetic_*/
 .vscode/
 .idea/
 *.swp
