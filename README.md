@@ -150,6 +150,15 @@ Logs and checkpoints are grouped by model type:
 - `logs/temporal_detector/<model>/<model>_run_YYYYMMDD_HHMMSS/`
 - `checkpoints/temporal_detector/<model>/<model>_run_YYYYMMDD_HHMMSS/`
 
+Augmentation options (examples):
+```bash
+# Threshold low-intensity pixels before noise/blur
+pixi run python scripts/train_temporal_detector.py --model temporal --threshold-low --threshold-value 125
+
+# Add adaptive noise + denoise
+pixi run python scripts/train_temporal_detector.py --model temporal --noise-prob 0.6 --adaptive-noise --denoise --denoise-prob 0.2
+```
+
 #### Legacy WATSON Pipeline
 
 ```bash
