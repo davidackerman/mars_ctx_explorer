@@ -97,6 +97,7 @@ black = ">=24.0.0"
 ruff = ">=0.2.0"
 mypy = ">=1.8.0"
 pre-commit = ">=3.6.0"
+streamlit = ">=1.40.0"
 
 [tool.pixi.feature.notebooks.pypi-dependencies]
 jupyter = ">=1.0.0"
@@ -121,6 +122,8 @@ notebook = "jupyter lab notebooks/"
 # Pipeline tasks
 ctx-pipeline = "ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml"
 backyard-worlds = "backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml"
+ctx-build-sim-index = "python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity"
+ctx-similarity-app = "streamlit run scripts/ctx_similarity_app.py -- --index-dir outputs/ctx_similarity"
 
 # Tool-specific configurations
 [tool.black]

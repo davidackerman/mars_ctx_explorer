@@ -110,6 +110,32 @@ ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --skip-tiling -
 - `tile_clusters.csv` - Cluster assignments and probabilities
 - `tile_novelty.csv` - Novelty scores for unique regions
 
+#### CTX Similar Image Explorer (Click-to-Similar)
+
+```bash
+# 1) Build embeddings + FAISS index for CTX images
+pixi run ctx-build-sim-index
+
+# Optional: custom settings
+pixi run python scripts/build_ctx_retrieval_index.py \
+  --image-dir data/raw/ctx \
+  --index-dir outputs/ctx_similarity \
+  --device cuda \
+  --batch-size 128
+
+# 2) Launch local web app
+pixi run ctx-similarity-app
+```
+
+**Artifacts** (in `outputs/ctx_similarity/`):
+- `embeddings.parquet` - Image embeddings
+- `faiss.index` - Similarity search index
+- `metadata.parquet` - Image metadata + row IDs
+
+The app supports sidebar filtering by image path text, sol range (when solvable from filenames/paths),
+and source folder. If you already built an older index, rebuild once so `metadata.parquet` includes
+the new metadata columns.
+
 #### Backyard Worlds Brown Dwarf Detection
 
 ```bash
