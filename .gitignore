@@ -1,3 +1,5 @@
+checkpoints/
+
 # Python
 outputs/
 isis3data/
@@ -37,7 +39,9 @@ env.bak/
 venv.bak/
 
 # IDEs
+data/backyard_worlds/subjects_toprand_1000
 data/backyard_worlds/subjects/
+data/backyard_worlds/synthetic_*/
 .vscode/
 .idea/
 *.swp
