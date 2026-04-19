@@ -15,6 +15,10 @@ from .base import EmbeddingExtractor
 
 logger = logging.getLogger(__name__)
 
+# CTX and other scientific rasters can legitimately exceed Pillow's default
+# decompression bomb threshold; disable hard limit for trusted local datasets.
+Image.MAX_IMAGE_PIXELS = None
+
 
 class ImagePathDataset(Dataset):
     """Simple dataset for loading images from file paths."""
@@ -118,8 +122,7 @@ class EmbeddingPipeline:
         # Filter out already processed images
         remaining_paths = [p for p in image_paths if str(p) not in processed_paths]
         logger.info(
-            f"Processing {len(remaining_paths)} images "
-            f"({len(processed_paths)} already done)"
+            f"Processing {len(remaining_paths)} images " f"({len(processed_paths)} already done)"
         )
 
         if len(remaining_paths) == 0:
@@ -152,18 +155,12 @@ class EmbeddingPipeline:
             # Save intermediate results
             if len(all_paths) % save_frequency == 0:
                 logger.info(f"Saving intermediate results ({len(all_paths)} processed)")
-                self._save_results(
-                    output_path, all_embeddings, all_paths, append=resume
-                )
+                self._save_results(output_path, all_embeddings, all_paths, append=resume)
 
         # Final save
         logger.info(f"Saving final results to {output_path}")
-        embeddings_array = (
-            np.vstack(all_embeddings) if all_embeddings else np.array([])
-        )
-        self._save_results(
-            output_path, [embeddings_array], all_paths, append=resume, final=True
-        )
+        embeddings_array = np.vstack(all_embeddings) if all_embeddings else np.array([])
+        self._save_results(output_path, [embeddings_array], all_paths, append=resume, final=True)
 
         return self._load_results(output_path)
 

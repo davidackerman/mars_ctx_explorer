@@ -94,6 +94,9 @@ pixi shell
 #### Mars CTX Terrain Classification
 
 ```bash
+# Download CTX images first (writes into data/raw/ctx)
+pixi run ctx-download
+
 # Run full pipeline (assumes CTX images in data/raw/ctx/)
 pixi run ctx-pipeline
 
@@ -116,6 +119,16 @@ ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --skip-tiling -
 # 1) Build embeddings + FAISS index for CTX images
 pixi run ctx-build-sim-index
 
+# Recommended for very large CTX TIFFs: chunkwise tiling before embeddings
+pixi run python scripts/build_ctx_retrieval_index.py \
+  --image-dir data/raw/ctx \
+  --index-dir outputs/ctx_similarity \
+  --device cpu \
+  --model-name dinov2_vitb14 \
+  --chunkwise \
+  --tile-size 1024 \
+  --tile-stride 1024
+
 # Optional: custom settings
 pixi run python scripts/build_ctx_retrieval_index.py \
   --image-dir data/raw/ctx \
@@ -127,6 +140,12 @@ pixi run python scripts/build_ctx_retrieval_index.py \
 pixi run ctx-similarity-app
 ```
 
+If you run commands manually in bash, use plain file paths (not markdown links), for example:
+
+```bash
+pixi run python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity --device cpu --model-name dinov2_vitb14
+```
+
 **Artifacts** (in `outputs/ctx_similarity/`):
 - `embeddings.parquet` - Image embeddings
 - `faiss.index` - Similarity search index
@@ -135,6 +154,9 @@ pixi run ctx-similarity-app
 The app supports sidebar filtering by image path text, sol range (when solvable from filenames/paths),
 and source folder. If you already built an older index, rebuild once so `metadata.parquet` includes
 the new metadata columns.
+
+If CTX `manifest.json` is present near your image directory (or passed explicitly with `--manifest`),
+the indexer also joins `center_lon`/`center_lat` so the app can filter by geographic region.
 
 #### Backyard Worlds Brown Dwarf Detection
 

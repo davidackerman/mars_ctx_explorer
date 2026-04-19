@@ -3,7 +3,9 @@
 import logging
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+import json
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,131 @@ def _extract_sol_from_path(path_str: str):
         return int(match.group(1))
 
     return None
+
+
+def _extract_product_id(path_str: str) -> str:
+    """Extract product identifier from image filename stem."""
+    stem = Path(path_str).stem
+    tile_match = re.match(r"^(?P<product>.+?)_tile_\d+_\d+$", stem)
+    if tile_match:
+        return tile_match.group("product")
+    return stem
+
+
+def generate_chunk_tiles(
+    image_paths: List[Path],
+    tile_output_dir: Path,
+    tile_size: int = 1024,
+    stride: int = 1024,
+    min_std: float = 5.0,
+) -> List[Path]:
+    """Generate chunked PNG tiles from large source images for retrieval.
+
+    This avoids loading entire high-resolution CTX rasters into memory during
+    embedding extraction.
+
+    Args:
+        image_paths: Source image paths
+        tile_output_dir: Directory where tile PNG files are written
+        tile_size: Tile side length in pixels
+        stride: Sliding-window stride
+        min_std: Minimum per-tile grayscale stddev to keep tile
+
+    Returns:
+        List of tile image paths
+    """
+    if tile_size <= 0:
+        raise ValueError("tile_size must be > 0")
+    if stride <= 0:
+        raise ValueError("stride must be > 0")
+
+    from PIL import Image
+
+    tile_output_dir = Path(tile_output_dir)
+    tile_output_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_paths: List[Path] = []
+    total_candidates = 0
+
+    for image_path in image_paths:
+        try:
+            with Image.open(image_path) as image:
+                if image.mode != "L":
+                    image = image.convert("L")
+
+                width, height = image.size
+                max_x = width - tile_size
+                max_y = height - tile_size
+
+                if max_x < 0 or max_y < 0:
+                    logger.debug(f"Skipping {image_path.name}: smaller than tile_size")
+                    continue
+
+                for y_offset in range(0, max_y + 1, stride):
+                    for x_offset in range(0, max_x + 1, stride):
+                        total_candidates += 1
+                        tile = image.crop(
+                            (x_offset, y_offset, x_offset + tile_size, y_offset + tile_size)
+                        )
+                        tile_array = np.array(tile)
+
+                        if float(tile_array.std()) < min_std:
+                            continue
+
+                        tile_name = f"{image_path.stem}_tile_{y_offset:06d}_{x_offset:06d}.png"
+                        tile_path = tile_output_dir / tile_name
+                        tile.save(tile_path, format="PNG")
+                        tile_paths.append(tile_path)
+
+        except Exception as exc:
+            logger.warning(f"Failed to tile {image_path}: {exc}")
+
+    logger.info(
+        f"Generated {len(tile_paths)} tiles from {len(image_paths)} images "
+        f"(candidates={total_candidates}, min_std={min_std})"
+    )
+    return tile_paths
+
+
+def _infer_manifest_path_from_images(image_paths: pd.Series) -> Optional[Path]:
+    """Infer CTX manifest path by checking image parent dirs for manifest.json."""
+    for path_str in image_paths.astype(str).tolist():
+        path = Path(path_str)
+        direct_candidate = path.parent / "manifest.json"
+        if direct_candidate.exists():
+            return direct_candidate
+
+        for parent in path.parents:
+            candidate = parent / "manifest.json"
+            if candidate.exists():
+                return candidate
+
+    return None
+
+
+def _load_ctx_manifest_dataframe(manifest_path: Path) -> pd.DataFrame:
+    """Load CTX downloader manifest entries as a dataframe."""
+    with open(manifest_path, "r") as manifest_file:
+        manifest = json.load(manifest_file)
+
+    downloaded_images = manifest.get("downloaded_images", {})
+    rows = []
+    for product_id, entry in downloaded_images.items():
+        rows.append(
+            {
+                "product_id": product_id,
+                "manifest_img_path": entry.get("img_path"),
+                "center_lon": entry.get("center_lon"),
+                "center_lat": entry.get("center_lat"),
+                "emission_angle": entry.get("emission_angle"),
+                "incidence_angle": entry.get("incidence_angle"),
+                "solar_longitude": entry.get("solar_longitude"),
+                "download_date": entry.get("download_date"),
+                "file_size_mb": entry.get("file_size_mb"),
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def discover_images(image_dir: Path, recursive: bool = True) -> List[Path]:
@@ -158,6 +285,7 @@ class CTXSimilarityIndex:
         embeddings_path: Path,
         index_path: Path,
         metadata_path: Path,
+        manifest_path: Optional[Path] = None,
         normalize: bool = True,
     ) -> "CTXSimilarityIndex":
         """Build and persist FAISS index artifacts from embeddings parquet."""
@@ -198,7 +326,45 @@ class CTXSimilarityIndex:
         metadata["parent_dir"] = metadata["image_path"].map(
             lambda value: Path(str(value)).parent.name
         )
-        metadata["sol"] = metadata["image_path"].map(lambda value: _extract_sol_from_path(str(value)))
+        metadata["product_id"] = metadata["image_path"].map(
+            lambda value: _extract_product_id(str(value))
+        )
+        metadata["sol"] = metadata["image_path"].map(
+            lambda value: _extract_sol_from_path(str(value))
+        )
+
+        selected_manifest = Path(manifest_path) if manifest_path is not None else None
+        if selected_manifest is None:
+            selected_manifest = _infer_manifest_path_from_images(metadata["image_path"])
+
+        if selected_manifest is not None and selected_manifest.exists():
+            logger.info(f"Joining manifest metadata from {selected_manifest}")
+            manifest_df = _load_ctx_manifest_dataframe(selected_manifest)
+            if len(manifest_df) > 0:
+                metadata = metadata.merge(manifest_df, on="product_id", how="left")
+
+                for column_name in [
+                    "center_lon",
+                    "center_lat",
+                    "emission_angle",
+                    "incidence_angle",
+                    "solar_longitude",
+                    "file_size_mb",
+                ]:
+                    if column_name in metadata.columns:
+                        metadata[column_name] = pd.to_numeric(
+                            metadata[column_name], errors="coerce"
+                        )
+
+                matched_rows = (
+                    metadata["center_lon"].notna().sum() if "center_lon" in metadata.columns else 0
+                )
+                logger.info(f"Manifest metadata matched for {matched_rows}/{len(metadata)} images")
+            else:
+                logger.warning("Manifest found but contains no downloaded_images entries")
+        else:
+            logger.info("No CTX manifest found for metadata join; skipping geospatial enrichment")
+
         metadata.to_parquet(metadata_path, index=False)
 
         logger.info(

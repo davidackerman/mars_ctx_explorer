@@ -39,7 +39,9 @@ def main() -> None:
     st.sidebar.header("Settings")
     index_dir = st.sidebar.text_input("Index directory", value=str(args.index_dir))
     top_k = st.sidebar.slider("Neighbors", min_value=3, max_value=30, value=12)
-    page_size = st.sidebar.slider("Gallery page size", min_value=12, max_value=120, value=36, step=12)
+    page_size = st.sidebar.slider(
+        "Gallery page size", min_value=12, max_value=120, value=36, step=12
+    )
 
     index = load_index(Path(index_dir))
     metadata = index.metadata.copy()
@@ -79,6 +81,48 @@ def main() -> None:
                 default=folder_values,
             )
             metadata = metadata[metadata["parent_dir"].isin(selected_folders)]
+
+    has_geo = "center_lon" in metadata.columns and "center_lat" in metadata.columns
+    if has_geo:
+        geo_rows = metadata[metadata["center_lon"].notna() & metadata["center_lat"].notna()]
+        if len(geo_rows) > 0:
+            st.sidebar.markdown("---")
+            st.sidebar.subheader("Region Filter")
+
+            lon_min = float(geo_rows["center_lon"].min())
+            lon_max = float(geo_rows["center_lon"].max())
+            lat_min = float(geo_rows["center_lat"].min())
+            lat_max = float(geo_rows["center_lat"].max())
+
+            selected_lon = st.sidebar.slider(
+                "Longitude",
+                min_value=lon_min,
+                max_value=lon_max,
+                value=(lon_min, lon_max),
+            )
+            selected_lat = st.sidebar.slider(
+                "Latitude",
+                min_value=lat_min,
+                max_value=lat_max,
+                value=(lat_min, lat_max),
+            )
+
+            metadata = metadata[
+                (
+                    metadata["center_lon"].isna()
+                    | (
+                        (metadata["center_lon"] >= selected_lon[0])
+                        & (metadata["center_lon"] <= selected_lon[1])
+                    )
+                )
+                & (
+                    metadata["center_lat"].isna()
+                    | (
+                        (metadata["center_lat"] >= selected_lat[0])
+                        & (metadata["center_lat"] <= selected_lat[1])
+                    )
+                )
+            ]
 
     if len(metadata) == 0:
         st.warning("No images match current filter.")
@@ -135,7 +179,19 @@ def main() -> None:
     st.divider()
     st.subheader("Neighbor Table")
     display_cols = ["row_id", "image_path", score_col]
-    extras = [c for c in ["filename", "parent_dir", "product_id", "sol", "source_image"] if c in results.columns]
+    extras = [
+        c
+        for c in [
+            "filename",
+            "parent_dir",
+            "product_id",
+            "sol",
+            "center_lon",
+            "center_lat",
+            "source_image",
+        ]
+        if c in results.columns
+    ]
     st.dataframe(results[display_cols + extras], use_container_width=True)
 
 

@@ -9,6 +9,7 @@ from scientific_pipelines.planetary.mars.ctx.retrieval import (
     CTXSimilarityIndex,
     build_ctx_embeddings,
     discover_images,
+    generate_chunk_tiles,
 )
 
 
@@ -42,6 +43,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to existing embeddings parquet (skip embedding extraction if provided)",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="Optional CTX manifest.json path for metadata enrichment (auto-detected if omitted)",
     )
     parser.add_argument(
         "--model-name",
@@ -88,6 +95,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable fp16 inference for faster CUDA extraction",
     )
+    parser.add_argument(
+        "--chunkwise",
+        action="store_true",
+        help="Tile large images into chunk PNGs before embedding",
+    )
+    parser.add_argument(
+        "--tile-size",
+        type=int,
+        default=1024,
+        help="Chunk tile size (used with --chunkwise)",
+    )
+    parser.add_argument(
+        "--tile-stride",
+        type=int,
+        default=1024,
+        help="Chunk tile stride (used with --chunkwise)",
+    )
+    parser.add_argument(
+        "--tile-min-std",
+        type=float,
+        default=5.0,
+        help="Minimum grayscale stddev to keep tile (used with --chunkwise)",
+    )
 
     return parser.parse_args()
 
@@ -105,9 +135,27 @@ def main() -> None:
         if len(image_paths) == 0:
             raise ValueError(f"No supported images found in {args.image_dir}")
 
+        embedding_input_paths = image_paths
+        if args.chunkwise:
+            chunk_dir = args.index_dir / "tiles"
+            logger.info(
+                "Generating chunk tiles before embedding "
+                f"(tile_size={args.tile_size}, stride={args.tile_stride}, min_std={args.tile_min_std})"
+            )
+            embedding_input_paths = generate_chunk_tiles(
+                image_paths=image_paths,
+                tile_output_dir=chunk_dir,
+                tile_size=args.tile_size,
+                stride=args.tile_stride,
+                min_std=args.tile_min_std,
+            )
+            if len(embedding_input_paths) == 0:
+                raise ValueError("Chunkwise tiling produced zero tiles; adjust tile parameters")
+            logger.info(f"Using {len(embedding_input_paths)} chunk tiles for embedding extraction")
+
         logger.info("Starting embedding extraction")
         build_ctx_embeddings(
-            image_paths=image_paths,
+            image_paths=embedding_input_paths,
             output_path=embeddings_path,
             model_name=args.model_name,
             device=args.device,
@@ -124,6 +172,7 @@ def main() -> None:
         embeddings_path=embeddings_path,
         index_path=index_path,
         metadata_path=metadata_path,
+        manifest_path=args.manifest,
         normalize=not args.no_normalize,
     )
 
