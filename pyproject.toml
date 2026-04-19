@@ -122,6 +122,7 @@ notebook = "jupyter lab notebooks/"
 # Pipeline tasks
 ctx-pipeline = "ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml"
 backyard-worlds = "backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml"
+ctx-download = "python scripts/download_ctx_images.py --output-dir data/raw/ctx --limit 100"
 ctx-build-sim-index = "python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity"
 ctx-similarity-app = "streamlit run scripts/ctx_similarity_app.py -- --index-dir outputs/ctx_similarity"
 
