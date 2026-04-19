@@ -3,7 +3,9 @@
 import json
 import logging
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -187,32 +189,30 @@ class CTXDownloader:
         self,
         image_list: List[Dict],
         overwrite: bool = False,
+        max_workers: int = 1,
     ) -> List[Path]:
         """
         Download CTX image files from ODE search results and process them.
 
         Downloads IMG (image data) and XML (PDS label) files for each product,
         then processes through ISIS3 pipeline (if enabled) or GDAL conversion.
+        When max_workers > 1, per-image processing runs concurrently via threads;
+        the heavy CPU work is inside ISIS3 subprocesses so threads parallelize well.
 
         Args:
             image_list: List of image metadata dicts from search_images()
             overwrite: If True, re-download and reprocess existing files
-
-        Returns:
-            List of paths to processed GeoTIFF files
-
-        Example:
-            >>> images = downloader.search_images(limit=10)
-            >>> tif_paths = downloader.download_images(images)
+            max_workers: Number of concurrent ISIS3 pipelines (default 1 = serial)
         """
-        logger.info(f"Downloading {len(image_list)} CTX images")
+        logger.info(
+            f"Downloading {len(image_list)} CTX images (workers={max_workers})"
+        )
 
-        downloaded_paths = []
+        pending: List[Dict] = []
+        downloaded_paths: List[Path] = []
 
-        for image_meta in tqdm(image_list, desc="Downloading CTX images"):
+        for image_meta in image_list:
             product_id = image_meta["product_id"]
-
-            # Check if already downloaded (resume capability)
             if not overwrite and product_id in self.manifest["downloaded_images"]:
                 existing = self.manifest["downloaded_images"][product_id]
                 img_path = Path(existing["img_path"])
@@ -220,18 +220,42 @@ class CTXDownloader:
                     logger.debug(f"Skipping {product_id} (already downloaded)")
                     downloaded_paths.append(img_path)
                     continue
+            pending.append(image_meta)
 
-            # Download IMG and XML files
+        if not pending:
+            self._save_manifest()
+            logger.info(f"Successfully downloaded {len(downloaded_paths)} images")
+            return downloaded_paths
+
+        manifest_lock = threading.Lock()
+
+        def _run(image_meta: Dict):
+            product_id = image_meta["product_id"]
             try:
                 img_path = self._download_product_files(image_meta)
-                downloaded_paths.append(img_path)
-
-                # Update manifest
-                self._add_to_manifest(image_meta, img_path)
-
+                with manifest_lock:
+                    self._add_to_manifest(image_meta, img_path)
+                return img_path
             except Exception as e:
                 logger.error(f"Failed to download {product_id}: {e}")
-                continue
+                return None
+
+        if max_workers <= 1:
+            for image_meta in tqdm(pending, desc="Downloading CTX images"):
+                result = _run(image_meta)
+                if result is not None:
+                    downloaded_paths.append(result)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_run, meta) for meta in pending]
+                for fut in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc="Downloading CTX images",
+                ):
+                    result = fut.result()
+                    if result is not None:
+                        downloaded_paths.append(result)
 
         self._save_manifest()
         logger.info(f"Successfully downloaded {len(downloaded_paths)} images")
@@ -546,8 +570,8 @@ class CTXDownloader:
                     "isis2std",
                     f"from={map_cube}",
                     f"to={tif_path}",
-                    "format=GTiff",
-                    "bittype=real",  # Preserve full dynamic range
+                    "format=TIFF",
+                    "bittype=U16BIT",  # Preserve full dynamic range
                 ],
                 check=True,
                 capture_output=True,

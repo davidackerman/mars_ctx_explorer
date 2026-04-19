@@ -45,27 +45,65 @@ def _extract_product_id(path_str: str) -> str:
     return stem
 
 
+def _load_grayscale_stretched(image_path: Path) -> "np.ndarray":
+    """Load an image as an 8-bit grayscale numpy array, stretching 16-bit input.
+
+    ISIS3 isis2std writes 16-bit TIFFs (U16BIT) whose radiance values span far
+    beyond 0-255. Naively calling PIL's `convert("L")` clips everything >=255
+    to white, destroying the signal. This helper reads the raw pixel values and
+    applies a per-image linear percentile stretch before quantizing to 8-bit.
+    NoData (value 0) stays 0.
+    """
+    from osgeo import gdal
+
+    gdal.UseExceptions()
+    ds = gdal.Open(str(image_path))
+    if ds is None:
+        raise IOError(f"GDAL could not open {image_path}")
+    band = ds.GetRasterBand(1)
+    arr = band.ReadAsArray()
+
+    if arr.ndim == 3:
+        arr = arr[0]
+
+    if arr.dtype == np.uint8:
+        return arr.copy()
+
+    valid_mask = arr > 0
+    if not valid_mask.any():
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    valid_values = arr[valid_mask]
+    lo = float(np.percentile(valid_values, 1.0))
+    hi = float(np.percentile(valid_values, 99.0))
+    if hi <= lo:
+        hi = float(valid_values.max())
+        lo = float(valid_values.min())
+    if hi <= lo:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    stretched = np.clip((arr.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+    stretched[~valid_mask] = 0.0
+    return (stretched * 255.0 + 0.5).astype(np.uint8)
+
+
 def generate_chunk_tiles(
     image_paths: List[Path],
     tile_output_dir: Path,
     tile_size: int = 1024,
     stride: int = 1024,
     min_std: float = 5.0,
+    max_nodata_frac: float = 0.1,
 ) -> List[Path]:
     """Generate chunked PNG tiles from large source images for retrieval.
-
-    This avoids loading entire high-resolution CTX rasters into memory during
-    embedding extraction.
 
     Args:
         image_paths: Source image paths
         tile_output_dir: Directory where tile PNG files are written
         tile_size: Tile side length in pixels
         stride: Sliding-window stride
-        min_std: Minimum per-tile grayscale stddev to keep tile
-
-    Returns:
-        List of tile image paths
+        min_std: Minimum per-tile grayscale stddev to keep tile (after NoData removal)
+        max_nodata_frac: Drop tiles whose fraction of zero pixels exceeds this
     """
     if tile_size <= 0:
         raise ValueError("tile_size must be > 0")
@@ -82,40 +120,48 @@ def generate_chunk_tiles(
 
     for image_path in image_paths:
         try:
-            with Image.open(image_path) as image:
-                if image.mode != "L":
-                    image = image.convert("L")
+            full_array = _load_grayscale_stretched(Path(image_path))
+            height, width = full_array.shape
+            max_x = width - tile_size
+            max_y = height - tile_size
 
-                width, height = image.size
-                max_x = width - tile_size
-                max_y = height - tile_size
+            if max_x < 0 or max_y < 0:
+                logger.debug(f"Skipping {image_path.name}: smaller than tile_size")
+                continue
 
-                if max_x < 0 or max_y < 0:
-                    logger.debug(f"Skipping {image_path.name}: smaller than tile_size")
-                    continue
+            for y_offset in range(0, max_y + 1, stride):
+                for x_offset in range(0, max_x + 1, stride):
+                    total_candidates += 1
+                    tile_array = full_array[
+                        y_offset : y_offset + tile_size,
+                        x_offset : x_offset + tile_size,
+                    ]
 
-                for y_offset in range(0, max_y + 1, stride):
-                    for x_offset in range(0, max_x + 1, stride):
-                        total_candidates += 1
-                        tile = image.crop(
-                            (x_offset, y_offset, x_offset + tile_size, y_offset + tile_size)
-                        )
-                        tile_array = np.array(tile)
+                    nodata_frac = float((tile_array == 0).mean())
+                    if nodata_frac > max_nodata_frac:
+                        continue
 
-                        if float(tile_array.std()) < min_std:
-                            continue
+                    content_mask = tile_array > 0
+                    if not content_mask.any():
+                        continue
+                    content_std = float(tile_array[content_mask].std())
+                    if content_std < min_std:
+                        continue
 
-                        tile_name = f"{image_path.stem}_tile_{y_offset:06d}_{x_offset:06d}.png"
-                        tile_path = tile_output_dir / tile_name
-                        tile.save(tile_path, format="PNG")
-                        tile_paths.append(tile_path)
+                    tile_name = (
+                        f"{image_path.stem}_tile_{y_offset:06d}_{x_offset:06d}.png"
+                    )
+                    tile_path = tile_output_dir / tile_name
+                    Image.fromarray(tile_array, mode="L").save(tile_path, format="PNG")
+                    tile_paths.append(tile_path)
 
         except Exception as exc:
             logger.warning(f"Failed to tile {image_path}: {exc}")
 
     logger.info(
         f"Generated {len(tile_paths)} tiles from {len(image_paths)} images "
-        f"(candidates={total_candidates}, min_std={min_std})"
+        f"(candidates={total_candidates}, min_std={min_std}, "
+        f"max_nodata_frac={max_nodata_frac})"
     )
     return tile_paths
 
@@ -393,4 +439,18 @@ class CTXSimilarityIndex:
         if not include_self:
             results = results[results["row_id"] != row_id].head(k)
 
+        return results.reset_index(drop=True)
+
+    def query_by_vector(self, query_vector: np.ndarray, k: int = 12) -> pd.DataFrame:
+        """Query top-k nearest images using a raw query embedding vector."""
+        import faiss
+
+        vec = np.asarray(query_vector, dtype="float32").reshape(1, -1)
+        if self.normalize:
+            faiss.normalize_L2(vec)
+        distances, indices = self.index.search(vec, k)
+
+        results = self.metadata.iloc[indices[0]].copy()
+        score_column = "similarity" if self.normalize else "distance"
+        results[score_column] = distances[0]
         return results.reset_index(drop=True)

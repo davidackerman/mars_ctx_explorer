@@ -67,6 +67,18 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable ISIS3 radiometric calibration step",
     )
+    parser.add_argument(
+        "--map-resolution",
+        type=float,
+        default=None,
+        help="cam2map output resolution in meters/pixel (default: native ~6 m/px)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Concurrent ISIS3 pipelines (1 = serial)",
+    )
 
     return parser.parse_args()
 
@@ -78,6 +90,7 @@ def main() -> None:
         output_dir=args.output_dir,
         use_isis3=not args.no_isis3,
         apply_calibration=not args.no_calibration,
+        map_resolution=args.map_resolution,
     )
 
     image_list = downloader.search_images(
@@ -92,7 +105,7 @@ def main() -> None:
         logger.warning("No CTX images found for the requested query")
         return
 
-    downloaded_paths = downloader.download_images(image_list)
+    downloaded_paths = downloader.download_images(image_list, max_workers=args.workers)
     logger.info(f"Downloaded {len(downloaded_paths)} CTX images into {args.output_dir}")
     logger.info(f"Manifest: {args.output_dir / 'manifest.json'}")
 

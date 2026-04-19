@@ -107,6 +107,9 @@ wandb/
 tensorboard/
 mlruns/
 
+# ISIS3 runtime log
+print.prt
+
 # Temporary files
 *.tmp
 *.bak

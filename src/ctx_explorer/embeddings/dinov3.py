@@ -39,16 +39,24 @@ class DINOv3Extractor(EmbeddingExtractor):
     """
 
     MODEL_DIMS = {
-        # DINOv2 models
+        # DINOv2 models (patch 14)
         "dinov2_vits14": 384,
         "dinov2_vitb14": 768,
         "dinov2_vitl14": 1024,
         "dinov2_vitg14": 1536,
-        # DINOv3 models (same dimensions)
-        "dinov3_vits14": 384,
-        "dinov3_vitb14": 768,
-        "dinov3_vitl14": 1024,
-        "dinov3_vitg14": 1536,
+        # DINOv3 ViT models (patch 16)
+        "dinov3_vits16": 384,
+        "dinov3_vits16plus": 384,
+        "dinov3_vitb16": 768,
+        "dinov3_vitl16": 1024,
+        "dinov3_vitl16plus": 1024,
+        "dinov3_vith16plus": 1280,
+        "dinov3_vit7b16": 4096,
+        # DINOv3 ConvNeXt variants
+        "dinov3_convnext_tiny": 768,
+        "dinov3_convnext_small": 768,
+        "dinov3_convnext_base": 1024,
+        "dinov3_convnext_large": 1536,
     }
 
     def __init__(

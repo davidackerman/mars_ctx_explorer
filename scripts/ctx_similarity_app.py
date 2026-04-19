@@ -4,10 +4,16 @@
 from pathlib import Path
 import argparse
 
+import numpy as np
 import pandas as pd
 import streamlit as st
+from PIL import Image
+from streamlit_cropper import st_cropper
 
+from scientific_pipelines.core.embeddings import DINOv3Extractor
 from scientific_pipelines.planetary.mars.ctx.retrieval import CTXSimilarityIndex
+
+Image.MAX_IMAGE_PIXELS = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +29,22 @@ def load_index(index_dir: Path):
         metadata_path=index_dir / "metadata.parquet",
     )
     return index
+
+
+@st.cache_resource
+def load_extractor(model_name: str = "dinov2_vitb14", device: str = "cuda"):
+    extractor = DINOv3Extractor(model_name=model_name, device=device, use_half_precision=False)
+    transform = DINOv3Extractor.get_default_transforms()
+    return extractor, transform
+
+
+def embed_crop(extractor, transform, crop_image: Image.Image) -> np.ndarray:
+    """Run the DINO extractor on a single PIL crop and return its embedding vector."""
+    if crop_image.mode != "RGB":
+        crop_image = crop_image.convert("RGB")
+    tensor = transform(crop_image).unsqueeze(0)
+    embedding = extractor.extract(tensor)
+    return embedding[0]
 
 
 def _caption_for(path_str: str) -> str:
@@ -157,10 +179,38 @@ def main() -> None:
     selected_row = index.metadata[index.metadata["row_id"] == selected_row_id].iloc[0]
     selected_path = str(selected_row["image_path"])
 
-    st.subheader("Selected Image")
-    st.image(selected_path, caption=selected_path, use_container_width=True)
+    st.subheader("Selected Image — drag the box to pick a region")
+    query_mode = st.radio(
+        "Query mode",
+        options=["Whole tile", "Region crop"],
+        horizontal=True,
+    )
 
-    results = index.query_by_row_id(selected_row_id, k=top_k, include_self=False)
+    selected_pil = Image.open(selected_path)
+
+    if query_mode == "Region crop":
+        crop_pil = st_cropper(
+            selected_pil,
+            realtime_update=True,
+            box_color="#00ffae",
+            aspect_ratio=None,
+            return_type="image",
+            key=f"cropper_{selected_row_id}",
+        )
+        st.caption(f"Crop size: {crop_pil.size[0]}x{crop_pil.size[1]} px")
+
+        try:
+            extractor, transform = load_extractor()
+        except Exception as exc:
+            st.error(f"Failed to load embedding model: {exc}")
+            return
+
+        query_vector = embed_crop(extractor, transform, crop_pil)
+        results = index.query_by_vector(query_vector, k=top_k)
+    else:
+        st.image(selected_path, caption=selected_path, use_container_width=True)
+        results = index.query_by_row_id(selected_row_id, k=top_k, include_self=False)
+
     score_col = "similarity" if "similarity" in results.columns else "distance"
 
     st.subheader("Most Similar Images")
