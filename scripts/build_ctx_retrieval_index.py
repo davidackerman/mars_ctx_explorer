@@ -141,6 +141,29 @@ def parse_args() -> argparse.Namespace:
         default=518,
         help="Square input edge fed to the DINO backbone (multiple of patch size)",
     )
+    parser.add_argument(
+        "--index-type",
+        type=str,
+        default="flat",
+        choices=["flat", "ivfpq"],
+        help=(
+            "FAISS index type: 'flat' for exact search (small corpora), "
+            "'ivfpq' for compressed index (~100x smaller, slight recall loss; "
+            "required at global scale)"
+        ),
+    )
+    parser.add_argument(
+        "--pq-bytes",
+        type=int,
+        default=64,
+        help="Product-quantization bytes per vector in ivfpq mode (must divide the embedding dim)",
+    )
+    parser.add_argument(
+        "--nlist",
+        type=int,
+        default=None,
+        help="IVF coarse centroid count; default ~sqrt(N)",
+    )
 
     return parser.parse_args()
 
@@ -216,6 +239,9 @@ def main() -> None:
         normalize=not args.no_normalize,
         model_name=args.model_name,
         image_size=args.image_size,
+        index_type=args.index_type,
+        pq_bytes=args.pq_bytes,
+        nlist=args.nlist,
     )
 
     logger.info("Index build complete")

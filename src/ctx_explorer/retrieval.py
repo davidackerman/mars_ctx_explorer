@@ -40,6 +40,30 @@ def _extract_sol_from_path(path_str: str):
     return None
 
 
+def parse_product_id_latlon(product_id: str) -> Optional[dict]:
+    """Approximate center latitude/longitude from a CTX product id.
+
+    CTX product ids end with a ``<lat><N|S><lon><W|E>`` token, e.g.
+    ``T01_000803_1580_XN_22S253W`` → lat = -22, lon = 253°W = -253°. The number
+    fields are two-digit lat and three-digit lon, each integer degrees.
+
+    Longitudes returned in the -180..180 east-positive convention (so
+    ``253W`` becomes ``360 - 253 = 107°E``).
+    """
+    match = re.search(r"_(\d{2})([NS])(\d{3})([WE])$", product_id)
+    if not match:
+        return None
+    lat = int(match.group(1))
+    if match.group(2) == "S":
+        lat = -lat
+    lon = int(match.group(3))
+    if match.group(4) == "W":
+        lon = 360 - lon
+    if lon > 180:
+        lon -= 360
+    return {"lat": float(lat), "lon": float(lon)}
+
+
 def _extract_product_id(path_str: str) -> str:
     """Extract product identifier from image filename stem."""
     stem = Path(path_str).stem
@@ -392,8 +416,20 @@ class CTXSimilarityIndex:
         normalize: bool = True,
         model_name: Optional[str] = None,
         image_size: Optional[int] = None,
+        index_type: str = "flat",
+        pq_bytes: int = 64,
+        nlist: Optional[int] = None,
     ) -> "CTXSimilarityIndex":
-        """Build and persist FAISS index artifacts from embeddings parquet."""
+        """Build and persist FAISS index artifacts from embeddings parquet.
+
+        Args:
+            index_type: 'flat' (IndexFlat{IP,L2}) for exact search, or 'ivfpq'
+                for an IVF-PQ compressed index (trades small recall loss for
+                ~100× smaller index + faster search; required for global scale).
+            pq_bytes: Product-quantization code size per vector in ivfpq mode
+                (64 = 64 bytes / vector; good default for 1024-d inputs).
+            nlist: Number of IVF coarse centroids. None = auto (~sqrt(N)).
+        """
         embeddings_path = Path(embeddings_path)
         index_path = Path(index_path)
         metadata_path = Path(metadata_path)
@@ -423,11 +459,46 @@ class CTXSimilarityIndex:
 
         if normalize:
             faiss.normalize_L2(vectors)
-            index = faiss.IndexFlatIP(vectors.shape[1])
-        else:
-            index = faiss.IndexFlatL2(vectors.shape[1])
 
-        index.add(vectors)
+        metric = faiss.METRIC_INNER_PRODUCT if normalize else faiss.METRIC_L2
+
+        index_type_norm = index_type.lower().strip()
+        n_vectors, dim = vectors.shape
+
+        if index_type_norm == "flat":
+            if normalize:
+                index = faiss.IndexFlatIP(dim)
+            else:
+                index = faiss.IndexFlatL2(dim)
+            index.add(vectors)
+        elif index_type_norm == "ivfpq":
+            if n_vectors < 10_000:
+                logger.warning(
+                    f"IVF-PQ typically needs ≥10k vectors to train well; "
+                    f"got {n_vectors}. Index may be fine but recall may suffer."
+                )
+            effective_nlist = nlist or max(32, int(np.sqrt(n_vectors)))
+            if dim % pq_bytes != 0:
+                raise ValueError(
+                    f"pq_bytes ({pq_bytes}) must divide embedding dim ({dim})"
+                )
+            nbits = 8
+            logger.info(
+                f"Training IndexIVFPQ(nlist={effective_nlist}, "
+                f"m={pq_bytes}, nbits={nbits}) on {n_vectors} vectors"
+            )
+            quantizer = (
+                faiss.IndexFlatIP(dim) if normalize else faiss.IndexFlatL2(dim)
+            )
+            index = faiss.IndexIVFPQ(
+                quantizer, dim, effective_nlist, pq_bytes, nbits, metric
+            )
+            index.train(vectors)
+            index.add(vectors)
+            index.nprobe = min(16, effective_nlist)
+        else:
+            raise ValueError(f"Unknown index_type: {index_type}")
+
         index_path.parent.mkdir(parents=True, exist_ok=True)
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -448,6 +519,17 @@ class CTXSimilarityIndex:
         metadata["tile_scale"] = metadata["image_path"].map(
             lambda value: _tile_scale_from_path(str(value))
         )
+
+        def _approx_lat(pid: str):
+            p = parse_product_id_latlon(pid)
+            return p["lat"] if p else np.nan
+
+        def _approx_lon(pid: str):
+            p = parse_product_id_latlon(pid)
+            return p["lon"] if p else np.nan
+
+        metadata["approx_lat"] = metadata["product_id"].map(_approx_lat)
+        metadata["approx_lon"] = metadata["product_id"].map(_approx_lon)
 
         selected_manifest = Path(manifest_path) if manifest_path is not None else None
         if selected_manifest is None:
@@ -489,6 +571,7 @@ class CTXSimilarityIndex:
                 "image_size": image_size,
                 "embedding_dim": int(vectors.shape[1]),
                 "normalize": bool(normalize),
+                "index_type": index_type_norm,
             }
             sidecar_path = index_path.with_suffix(".model.json")
             with open(sidecar_path, "w") as fp:

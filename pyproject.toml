@@ -51,7 +51,7 @@ dependencies = [
     "faiss-cpu>=1.7.4",       # Fast kNN for novelty detection
     "numba>=0.59.0",          # JIT compiler (required for UMAP, needs 0.59+ for Python 3.12+)
     "termcolor>=2.0.0",       # Colored terminal output (required by DINOv3)
-    "tensorboard>=2.15.0", "streamlit-cropper>=0.3.1,<0.4",    # TensorBoard for training visualization
+    "tensorboard>=2.15.0", "streamlit-cropper>=0.3.1,<0.4", "fastapi>=0.110", "uvicorn[standard]>=0.27",    # TensorBoard for training visualization
 ]
 
 # Optional dependency groups (managed by Pixi - see tool.pixi.feature sections)
