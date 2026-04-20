@@ -101,22 +101,45 @@ def parse_args() -> argparse.Namespace:
         help="Tile large images into chunk PNGs before embedding",
     )
     parser.add_argument(
+        "--use-existing-tiles",
+        action="store_true",
+        help="Skip tile generation and re-embed the PNGs already in index-dir/tiles/",
+    )
+    parser.add_argument(
         "--tile-size",
         type=int,
         default=1024,
-        help="Chunk tile size (used with --chunkwise)",
+        help="Single-scale chunk tile size (ignored if --tile-scales is set)",
     )
     parser.add_argument(
         "--tile-stride",
         type=int,
         default=1024,
-        help="Chunk tile stride (used with --chunkwise)",
+        help="Single-scale chunk tile stride (ignored if --tile-scales is set)",
+    )
+    parser.add_argument(
+        "--tile-scales",
+        type=str,
+        default=None,
+        help="Comma-separated tile sizes for multi-scale indexing (e.g. '256,512,1024')",
+    )
+    parser.add_argument(
+        "--tile-stride-fraction",
+        type=float,
+        default=0.5,
+        help="Stride fraction per scale (multi-scale only). 0.5 = half-tile overlap",
     )
     parser.add_argument(
         "--tile-min-std",
         type=float,
         default=5.0,
         help="Minimum grayscale stddev to keep tile (used with --chunkwise)",
+    )
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=518,
+        help="Square input edge fed to the DINO backbone (multiple of patch size)",
     )
 
     return parser.parse_args()
@@ -136,15 +159,31 @@ def main() -> None:
             raise ValueError(f"No supported images found in {args.image_dir}")
 
         embedding_input_paths = image_paths
-        if args.chunkwise:
+        if args.use_existing_tiles:
             chunk_dir = args.index_dir / "tiles"
+            if not chunk_dir.exists():
+                raise FileNotFoundError(f"--use-existing-tiles: no tiles dir at {chunk_dir}")
+            embedding_input_paths = sorted(chunk_dir.glob("*.png"))
+            if not embedding_input_paths:
+                raise ValueError(f"--use-existing-tiles: zero PNGs under {chunk_dir}")
+            logger.info(f"Reusing {len(embedding_input_paths)} existing tiles from {chunk_dir}")
+        elif args.chunkwise:
+            chunk_dir = args.index_dir / "tiles"
+            tile_scales = (
+                [int(s) for s in args.tile_scales.split(",") if s.strip()]
+                if args.tile_scales
+                else None
+            )
             logger.info(
                 "Generating chunk tiles before embedding "
-                f"(tile_size={args.tile_size}, stride={args.tile_stride}, min_std={args.tile_min_std})"
+                f"(scales={tile_scales if tile_scales else [args.tile_size]}, "
+                f"stride_fraction={args.tile_stride_fraction}, min_std={args.tile_min_std})"
             )
             embedding_input_paths = generate_chunk_tiles(
                 image_paths=image_paths,
                 tile_output_dir=chunk_dir,
+                tile_scales=tile_scales,
+                stride_fraction=args.tile_stride_fraction,
                 tile_size=args.tile_size,
                 stride=args.tile_stride,
                 min_std=args.tile_min_std,
@@ -163,6 +202,7 @@ def main() -> None:
             num_workers=args.num_workers,
             use_half_precision=args.use_half,
             resume=not args.no_resume,
+            image_size=args.image_size,
         )
     else:
         logger.info(f"Using existing embeddings file: {embeddings_path}")
@@ -174,6 +214,8 @@ def main() -> None:
         metadata_path=metadata_path,
         manifest_path=args.manifest,
         normalize=not args.no_normalize,
+        model_name=args.model_name,
+        image_size=args.image_size,
     )
 
     logger.info("Index build complete")

@@ -10,7 +10,11 @@ import json
 import numpy as np
 import pandas as pd
 
-from scientific_pipelines.core.embeddings import DINOv3Extractor, EmbeddingPipeline
+from scientific_pipelines.core.embeddings import (
+    DINOv3Extractor,
+    DINOv3HFExtractor,
+    EmbeddingPipeline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,11 @@ def _extract_sol_from_path(path_str: str):
 def _extract_product_id(path_str: str) -> str:
     """Extract product identifier from image filename stem."""
     stem = Path(path_str).stem
+    scaled_tile_match = re.match(
+        r"^(?P<product>.+?)_s\d{4}_tile_\d+_\d+$", stem
+    )
+    if scaled_tile_match:
+        return scaled_tile_match.group("product")
     tile_match = re.match(r"^(?P<product>.+?)_tile_\d+_\d+$", stem)
     if tile_match:
         return tile_match.group("product")
@@ -87,11 +96,27 @@ def _load_grayscale_stretched(image_path: Path) -> "np.ndarray":
     return (stretched * 255.0 + 0.5).astype(np.uint8)
 
 
+TILE_FILENAME_RE = re.compile(
+    r"^(?P<product>.+?)_s(?P<scale>\d{4})_tile_(?P<y>\d{6})_(?P<x>\d{6})$"
+)
+
+
+def _tile_scale_from_path(path_str: str) -> Optional[int]:
+    """Extract tile scale (side-length px) from tile filename stem."""
+    stem = Path(path_str).stem
+    match = TILE_FILENAME_RE.match(stem)
+    if match is None:
+        return None
+    return int(match.group("scale"))
+
+
 def generate_chunk_tiles(
     image_paths: List[Path],
     tile_output_dir: Path,
+    tile_scales: Optional[List[int]] = None,
+    stride_fraction: float = 0.5,
     tile_size: int = 1024,
-    stride: int = 1024,
+    stride: Optional[int] = None,
     min_std: float = 5.0,
     max_nodata_frac: float = 0.1,
 ) -> List[Path]:
@@ -100,15 +125,31 @@ def generate_chunk_tiles(
     Args:
         image_paths: Source image paths
         tile_output_dir: Directory where tile PNG files are written
-        tile_size: Tile side length in pixels
-        stride: Sliding-window stride
-        min_std: Minimum per-tile grayscale stddev to keep tile (after NoData removal)
+        tile_scales: List of tile side lengths in pixels (enables multi-scale
+            indexing). Each tile gets a filename encoding its scale so the
+            retrieval index can filter queries by scale.
+        stride_fraction: Stride as a fraction of tile size for each scale
+            (default 0.5 = half-tile overlap)
+        tile_size: Single tile side length (only used when tile_scales is None)
+        stride: Single sliding-window stride (only used when tile_scales is
+            None; defaults to tile_size — non-overlapping)
+        min_std: Minimum per-tile grayscale stddev to keep tile
         max_nodata_frac: Drop tiles whose fraction of zero pixels exceeds this
     """
-    if tile_size <= 0:
-        raise ValueError("tile_size must be > 0")
-    if stride <= 0:
-        raise ValueError("stride must be > 0")
+    if tile_scales is None:
+        if tile_size <= 0:
+            raise ValueError("tile_size must be > 0")
+        effective_stride = stride if stride is not None else tile_size
+        if effective_stride <= 0:
+            raise ValueError("stride must be > 0")
+        scale_stride_pairs = [(tile_size, effective_stride)]
+    else:
+        if not tile_scales:
+            raise ValueError("tile_scales must be non-empty when provided")
+        scale_stride_pairs = [
+            (int(size), max(1, int(round(size * stride_fraction))))
+            for size in tile_scales
+        ]
 
     from PIL import Image
 
@@ -122,45 +163,50 @@ def generate_chunk_tiles(
         try:
             full_array = _load_grayscale_stretched(Path(image_path))
             height, width = full_array.shape
-            max_x = width - tile_size
-            max_y = height - tile_size
 
-            if max_x < 0 or max_y < 0:
-                logger.debug(f"Skipping {image_path.name}: smaller than tile_size")
-                continue
+            for scale_px, scale_stride in scale_stride_pairs:
+                max_x = width - scale_px
+                max_y = height - scale_px
+                if max_x < 0 or max_y < 0:
+                    continue
 
-            for y_offset in range(0, max_y + 1, stride):
-                for x_offset in range(0, max_x + 1, stride):
-                    total_candidates += 1
-                    tile_array = full_array[
-                        y_offset : y_offset + tile_size,
-                        x_offset : x_offset + tile_size,
-                    ]
+                for y_offset in range(0, max_y + 1, scale_stride):
+                    for x_offset in range(0, max_x + 1, scale_stride):
+                        total_candidates += 1
+                        tile_array = full_array[
+                            y_offset : y_offset + scale_px,
+                            x_offset : x_offset + scale_px,
+                        ]
 
-                    nodata_frac = float((tile_array == 0).mean())
-                    if nodata_frac > max_nodata_frac:
-                        continue
+                        nodata_frac = float((tile_array == 0).mean())
+                        if nodata_frac > max_nodata_frac:
+                            continue
 
-                    content_mask = tile_array > 0
-                    if not content_mask.any():
-                        continue
-                    content_std = float(tile_array[content_mask].std())
-                    if content_std < min_std:
-                        continue
+                        content_mask = tile_array > 0
+                        if not content_mask.any():
+                            continue
+                        content_std = float(tile_array[content_mask].std())
+                        if content_std < min_std:
+                            continue
 
-                    tile_name = (
-                        f"{image_path.stem}_tile_{y_offset:06d}_{x_offset:06d}.png"
-                    )
-                    tile_path = tile_output_dir / tile_name
-                    Image.fromarray(tile_array, mode="L").save(tile_path, format="PNG")
-                    tile_paths.append(tile_path)
+                        tile_name = (
+                            f"{image_path.stem}"
+                            f"_s{scale_px:04d}"
+                            f"_tile_{y_offset:06d}_{x_offset:06d}.png"
+                        )
+                        tile_path = tile_output_dir / tile_name
+                        Image.fromarray(tile_array, mode="L").save(
+                            tile_path, format="PNG"
+                        )
+                        tile_paths.append(tile_path)
 
         except Exception as exc:
             logger.warning(f"Failed to tile {image_path}: {exc}")
 
     logger.info(
         f"Generated {len(tile_paths)} tiles from {len(image_paths)} images "
-        f"(candidates={total_candidates}, min_std={min_std}, "
+        f"(scales={[p[0] for p in scale_stride_pairs]}, "
+        f"candidates={total_candidates}, min_std={min_std}, "
         f"max_nodata_frac={max_nodata_frac})"
     )
     return tile_paths
@@ -246,6 +292,7 @@ def build_ctx_embeddings(
     num_workers: int = 8,
     use_half_precision: bool = False,
     resume: bool = True,
+    image_size: int = 518,
 ) -> Path:
     """Build DINO embeddings for CTX images and save to parquet.
 
@@ -268,18 +315,28 @@ def build_ctx_embeddings(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    extractor = DINOv3Extractor(
-        model_name=model_name,
-        device=device,
-        use_half_precision=use_half_precision,
-    )
+    is_hf = "/" in model_name
+    if is_hf:
+        extractor = DINOv3HFExtractor(
+            model_name=model_name,
+            device=device,
+            use_half_precision=use_half_precision,
+        )
+        transform = DINOv3HFExtractor.get_default_transforms(image_size=image_size)
+    else:
+        extractor = DINOv3Extractor(
+            model_name=model_name,
+            device=device,
+            use_half_precision=use_half_precision,
+        )
+        transform = DINOv3Extractor.get_default_transforms(image_size=image_size)
 
     pipeline = EmbeddingPipeline(
         extractor=extractor,
         output_format="parquet",
         batch_size=batch_size,
         num_workers=num_workers,
-        transform=DINOv3Extractor.get_default_transforms(),
+        transform=transform,
     )
 
     embeddings, metadata = pipeline.extract_dataset(
@@ -333,6 +390,8 @@ class CTXSimilarityIndex:
         metadata_path: Path,
         manifest_path: Optional[Path] = None,
         normalize: bool = True,
+        model_name: Optional[str] = None,
+        image_size: Optional[int] = None,
     ) -> "CTXSimilarityIndex":
         """Build and persist FAISS index artifacts from embeddings parquet."""
         embeddings_path = Path(embeddings_path)
@@ -347,6 +406,14 @@ class CTXSimilarityIndex:
 
         if "embedding" not in df.columns or "image_path" not in df.columns:
             raise ValueError("Embeddings parquet must contain columns: image_path, embedding")
+
+        rows_before = len(df)
+        df = df.drop_duplicates(subset="image_path", keep="first").reset_index(drop=True)
+        if len(df) != rows_before:
+            logger.warning(
+                f"Dropped {rows_before - len(df)} duplicate embeddings "
+                f"(kept {len(df)}); likely from intermediate-save double-writes"
+            )
 
         vectors = np.vstack(df["embedding"].values).astype("float32")
         if vectors.ndim != 2 or vectors.shape[0] == 0:
@@ -377,6 +444,9 @@ class CTXSimilarityIndex:
         )
         metadata["sol"] = metadata["image_path"].map(
             lambda value: _extract_sol_from_path(str(value))
+        )
+        metadata["tile_scale"] = metadata["image_path"].map(
+            lambda value: _tile_scale_from_path(str(value))
         )
 
         selected_manifest = Path(manifest_path) if manifest_path is not None else None
@@ -413,6 +483,18 @@ class CTXSimilarityIndex:
 
         metadata.to_parquet(metadata_path, index=False)
 
+        if model_name is not None or image_size is not None:
+            sidecar = {
+                "model_name": model_name,
+                "image_size": image_size,
+                "embedding_dim": int(vectors.shape[1]),
+                "normalize": bool(normalize),
+            }
+            sidecar_path = index_path.with_suffix(".model.json")
+            with open(sidecar_path, "w") as fp:
+                json.dump(sidecar, fp, indent=2)
+            logger.info(f"Wrote model sidecar to {sidecar_path}")
+
         logger.info(
             f"Built similarity index at {index_path} with {index.ntotal} vectors "
             f"(dim={vectors.shape[1]})"
@@ -441,16 +523,40 @@ class CTXSimilarityIndex:
 
         return results.reset_index(drop=True)
 
-    def query_by_vector(self, query_vector: np.ndarray, k: int = 12) -> pd.DataFrame:
-        """Query top-k nearest images using a raw query embedding vector."""
+    def query_by_vector(
+        self,
+        query_vector: np.ndarray,
+        k: int = 12,
+        tile_scale: Optional[int] = None,
+        candidate_multiplier: int = 8,
+    ) -> pd.DataFrame:
+        """Query top-k nearest images using a raw query embedding vector.
+
+        When tile_scale is given, over-fetch candidates from FAISS and post-
+        filter to only that scale before returning the top-k. FAISS has no
+        native metadata filter so we rely on the multiplier to keep enough
+        candidates after filtering.
+        """
         import faiss
 
         vec = np.asarray(query_vector, dtype="float32").reshape(1, -1)
         if self.normalize:
             faiss.normalize_L2(vec)
-        distances, indices = self.index.search(vec, k)
 
-        results = self.metadata.iloc[indices[0]].copy()
         score_column = "similarity" if self.normalize else "distance"
-        results[score_column] = distances[0]
-        return results.reset_index(drop=True)
+        if tile_scale is None or "tile_scale" not in self.metadata.columns:
+            distances, indices = self.index.search(vec, k)
+            results = self.metadata.iloc[indices[0]].copy()
+            results[score_column] = distances[0]
+            return results.reset_index(drop=True)
+
+        candidate_k = max(k * candidate_multiplier, k)
+        candidate_k = min(candidate_k, self.index.ntotal)
+        distances, indices = self.index.search(vec, candidate_k)
+
+        candidates = self.metadata.iloc[indices[0]].copy()
+        candidates[score_column] = distances[0]
+        filtered = candidates[candidates["tile_scale"] == int(tile_scale)]
+        if len(filtered) == 0:
+            filtered = candidates
+        return filtered.head(k).reset_index(drop=True)

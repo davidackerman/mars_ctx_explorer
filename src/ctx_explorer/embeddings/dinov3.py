@@ -133,18 +133,21 @@ class DINOv3Extractor(EmbeddingExtractor):
         return self.MODEL_DIMS[self.model_name]
 
     @staticmethod
-    def get_default_transforms():
+    def get_default_transforms(image_size: int = 518):
         """
-        Get default image preprocessing transforms for DINOv3.
+        Get default image preprocessing transforms for DINO.
 
-        Returns:
-            torchvision.transforms composition for image preprocessing
+        Args:
+            image_size: Square input edge in pixels. Must be a multiple of the
+                backbone patch size (14 for dinov2_*/dinov3_*14, 16 for
+                dinov3_*16). Defaults to 518 which preserves more detail than
+                the classic 224 for high-resolution orbital imagery.
         """
         from torchvision import transforms as T
 
         return T.Compose(
             [
-                T.Resize((224, 224)),
+                T.Resize((image_size, image_size)),
                 T.ToTensor(),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
