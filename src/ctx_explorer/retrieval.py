@@ -134,6 +134,66 @@ def _tile_scale_from_path(path_str: str) -> Optional[int]:
     return int(match.group("scale"))
 
 
+def _tile_single_image(
+    image_path: Path,
+    tile_output_dir: Path,
+    scale_stride_pairs: List[tuple],
+    min_std: float,
+    max_nodata_frac: float,
+) -> tuple:
+    """Tile one source image. Returns (tile_paths, candidate_count, error_or_None).
+
+    Pulled out of the outer loop so each image can be tiled independently
+    (e.g. by a ProcessPoolExecutor worker). Pure per-image — no shared state.
+    """
+    from PIL import Image as _PImage
+
+    image_path = Path(image_path)
+    tile_paths: List[Path] = []
+    total_candidates = 0
+
+    try:
+        full_array = _load_grayscale_stretched(image_path)
+        height, width = full_array.shape
+
+        for scale_px, scale_stride in scale_stride_pairs:
+            max_x = width - scale_px
+            max_y = height - scale_px
+            if max_x < 0 or max_y < 0:
+                continue
+
+            for y_offset in range(0, max_y + 1, scale_stride):
+                for x_offset in range(0, max_x + 1, scale_stride):
+                    total_candidates += 1
+                    tile_array = full_array[
+                        y_offset : y_offset + scale_px,
+                        x_offset : x_offset + scale_px,
+                    ]
+
+                    nodata_frac = float((tile_array == 0).mean())
+                    if nodata_frac > max_nodata_frac:
+                        continue
+
+                    content_mask = tile_array > 0
+                    if not content_mask.any():
+                        continue
+                    content_std = float(tile_array[content_mask].std())
+                    if content_std < min_std:
+                        continue
+
+                    tile_name = (
+                        f"{image_path.stem}"
+                        f"_s{scale_px:04d}"
+                        f"_tile_{y_offset:06d}_{x_offset:06d}.png"
+                    )
+                    tile_path = tile_output_dir / tile_name
+                    _PImage.fromarray(tile_array, mode="L").save(tile_path, format="PNG")
+                    tile_paths.append(tile_path)
+        return tile_paths, total_candidates, None
+    except Exception as exc:
+        return tile_paths, total_candidates, f"{image_path}: {exc}"
+
+
 def generate_chunk_tiles(
     image_paths: List[Path],
     tile_output_dir: Path,
@@ -143,6 +203,7 @@ def generate_chunk_tiles(
     stride: Optional[int] = None,
     min_std: float = 5.0,
     max_nodata_frac: float = 0.1,
+    workers: int = 1,
 ) -> List[Path]:
     """Generate chunked PNG tiles from large source images for retrieval.
 
@@ -159,6 +220,9 @@ def generate_chunk_tiles(
             None; defaults to tile_size — non-overlapping)
         min_std: Minimum per-tile grayscale stddev to keep tile
         max_nodata_frac: Drop tiles whose fraction of zero pixels exceeds this
+        workers: Tiling concurrency. >1 runs per-image tiling in a
+            ProcessPoolExecutor — big win on multi-core machines since the
+            work is mostly GDAL I/O and NumPy slicing.
     """
     if tile_scales is None:
         if tile_size <= 0:
@@ -175,63 +239,55 @@ def generate_chunk_tiles(
             for size in tile_scales
         ]
 
-    from PIL import Image
-
     tile_output_dir = Path(tile_output_dir)
     tile_output_dir.mkdir(parents=True, exist_ok=True)
 
     tile_paths: List[Path] = []
     total_candidates = 0
 
-    for image_path in image_paths:
-        try:
-            full_array = _load_grayscale_stretched(Path(image_path))
-            height, width = full_array.shape
+    if workers > 1 and len(image_paths) > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from tqdm import tqdm
 
-            for scale_px, scale_stride in scale_stride_pairs:
-                max_x = width - scale_px
-                max_y = height - scale_px
-                if max_x < 0 or max_y < 0:
-                    continue
-
-                for y_offset in range(0, max_y + 1, scale_stride):
-                    for x_offset in range(0, max_x + 1, scale_stride):
-                        total_candidates += 1
-                        tile_array = full_array[
-                            y_offset : y_offset + scale_px,
-                            x_offset : x_offset + scale_px,
-                        ]
-
-                        nodata_frac = float((tile_array == 0).mean())
-                        if nodata_frac > max_nodata_frac:
-                            continue
-
-                        content_mask = tile_array > 0
-                        if not content_mask.any():
-                            continue
-                        content_std = float(tile_array[content_mask].std())
-                        if content_std < min_std:
-                            continue
-
-                        tile_name = (
-                            f"{image_path.stem}"
-                            f"_s{scale_px:04d}"
-                            f"_tile_{y_offset:06d}_{x_offset:06d}.png"
-                        )
-                        tile_path = tile_output_dir / tile_name
-                        Image.fromarray(tile_array, mode="L").save(
-                            tile_path, format="PNG"
-                        )
-                        tile_paths.append(tile_path)
-
-        except Exception as exc:
-            logger.warning(f"Failed to tile {image_path}: {exc}")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(
+                    _tile_single_image,
+                    Path(p),
+                    tile_output_dir,
+                    scale_stride_pairs,
+                    min_std,
+                    max_nodata_frac,
+                )
+                for p in image_paths
+            ]
+            for fut in tqdm(
+                as_completed(futures), total=len(futures), desc="Tiling"
+            ):
+                paths, cands, err = fut.result()
+                tile_paths.extend(paths)
+                total_candidates += cands
+                if err:
+                    logger.warning("Failed to tile %s", err)
+    else:
+        for image_path in image_paths:
+            paths, cands, err = _tile_single_image(
+                Path(image_path),
+                tile_output_dir,
+                scale_stride_pairs,
+                min_std,
+                max_nodata_frac,
+            )
+            tile_paths.extend(paths)
+            total_candidates += cands
+            if err:
+                logger.warning("Failed to tile %s", err)
 
     logger.info(
         f"Generated {len(tile_paths)} tiles from {len(image_paths)} images "
         f"(scales={[p[0] for p in scale_stride_pairs]}, "
         f"candidates={total_candidates}, min_std={min_std}, "
-        f"max_nodata_frac={max_nodata_frac})"
+        f"max_nodata_frac={max_nodata_frac}, workers={workers})"
     )
     return tile_paths
 

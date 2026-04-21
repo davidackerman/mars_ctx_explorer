@@ -54,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-isis3", action="store_true")
     parser.add_argument("--apply-calibration", action="store_true")
     parser.add_argument("--map-resolution", type=float, default=48.0)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=6,
+                        help="Download/ISIS3 threads (PDS rate-limits around 8)")
 
     # Tiling
     parser.add_argument(
@@ -66,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-stride-fraction", type=float, default=0.5)
     parser.add_argument("--tile-min-std", type=float, default=5.0)
     parser.add_argument("--tile-max-nodata-frac", type=float, default=0.1)
+    parser.add_argument("--tile-workers", type=int, default=8,
+                        help="CPU processes for parallel tile generation")
 
     # Embedding
     parser.add_argument("--model-name", default="facebook/dinov3-vitl16-pretrain-sat493m")
@@ -112,6 +115,7 @@ def main() -> None:
         tile_stride_fraction=args.tile_stride_fraction,
         tile_min_std=args.tile_min_std,
         tile_max_nodata_frac=args.tile_max_nodata_frac,
+        tile_workers=args.tile_workers,
         model_name=args.model_name,
         image_size=args.image_size,
         batch_size=args.batch_size,

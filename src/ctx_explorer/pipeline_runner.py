@@ -59,13 +59,14 @@ class PipelineConfig:
     use_isis3: bool = True
     apply_calibration: bool = False
     map_resolution: float = 48.0  # m/pixel; 24 is native
-    workers: int = 4
+    workers: int = 6  # download / ISIS3 threads (PDS rate-limits around 8)
 
     # tiling
     tile_scales: List[int] = field(default_factory=lambda: [512])
     tile_stride_fraction: float = 0.5
     tile_min_std: float = 5.0
     tile_max_nodata_frac: float = 0.1
+    tile_workers: int = 8  # CPU processes tiling in parallel
 
     # embedding
     model_name: str = "facebook/dinov3-vitl16-pretrain-sat493m"
@@ -365,6 +366,7 @@ def run(cfg: PipelineConfig) -> dict:
         stride_fraction=cfg.tile_stride_fraction,
         min_std=cfg.tile_min_std,
         max_nodata_frac=cfg.tile_max_nodata_frac,
+        workers=cfg.tile_workers,
     )
     logger.info(
         "Tiled %d images → %d tiles in %.1fs",
