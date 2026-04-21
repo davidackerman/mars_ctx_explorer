@@ -451,6 +451,15 @@ VIEWER_HTML = r"""<!doctype html>
     <p class="muted">Click a circle on the map to open its source image. Drag to draw a crop, then hit "Find similar".</p>
     <div style="margin-bottom: 10px;">
       <button id="surprise-btn">🔭 Surprise me (top anomalies)</button>
+      <button id="atlas-btn">🗺️ Terrain atlas</button>
+    </div>
+    <div id="positive-tray" style="display: none; margin: 8px 0; padding: 6px; background: #1a1a1a; border: 1px solid #333;">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span id="tray-count">0 positive examples</span>
+        <button id="tray-fewshot">Find more like these</button>
+        <button id="tray-clear">Clear tray</button>
+      </div>
+      <div id="tray-thumbs" style="display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;"></div>
     </div>
     <div id="selected"></div>
     <h2>Results</h2>
@@ -483,6 +492,164 @@ let sourceOriginalW = 0;
 let sourceOriginalH = 0;
 let previewScale = 1.0;
 let resultMarkers = [];
+
+// Few-shot positives tray --------------------------------------------------
+const positiveTray = new Set();
+
+function updateTrayUI() {
+  const tray = document.getElementById("positive-tray");
+  const count = document.getElementById("tray-count");
+  const thumbs = document.getElementById("tray-thumbs");
+  count.innerText = `${positiveTray.size} positive example${positiveTray.size === 1 ? "" : "s"}`;
+  tray.style.display = positiveTray.size > 0 ? "block" : "none";
+  thumbs.innerHTML = "";
+  positiveTray.forEach(p => {
+    const img = document.createElement("img");
+    img.src = `/api/tile?path=${encodeURIComponent(p)}`;
+    img.style.width = "60px";
+    img.style.height = "60px";
+    img.style.objectFit = "cover";
+    img.style.border = "1px solid #333";
+    img.title = p;
+    img.style.cursor = "pointer";
+    img.onclick = () => { positiveTray.delete(p); updateTrayUI(); };
+    thumbs.appendChild(img);
+  });
+}
+
+function addToTray(imagePath) {
+  positiveTray.add(imagePath);
+  updateTrayUI();
+}
+
+document.getElementById("tray-clear").onclick = () => {
+  positiveTray.clear();
+  updateTrayUI();
+};
+
+document.getElementById("tray-fewshot").onclick = async () => {
+  if (positiveTray.size === 0) return;
+  const btn = document.getElementById("tray-fewshot");
+  btn.disabled = true;
+  btn.innerText = "Searching...";
+  const resp = await fetch("/api/few_shot", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ positive_paths: Array.from(positiveTray), top_k: 20 }),
+  });
+  const data = await resp.json();
+  renderResults(data.results || [], "score");
+  btn.disabled = false;
+  btn.innerText = "Find more like these";
+};
+
+// Atlas modal --------------------------------------------------------------
+document.getElementById("atlas-btn").onclick = async () => {
+  const btn = document.getElementById("atlas-btn");
+  btn.disabled = true;
+  btn.innerText = "Building atlas...";
+  try {
+    const resp = await fetch("/api/atlas?max_points=5000");
+    const data = await resp.json();
+    renderAtlas(data.points || []);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "🗺️ Terrain atlas";
+  }
+};
+
+function renderAtlas(points) {
+  const existing = document.getElementById("atlas-modal");
+  if (existing) existing.remove();
+  if (!points.length) { return; }
+
+  const modal = document.createElement("div");
+  modal.id = "atlas-modal";
+  modal.style.cssText = "position:fixed;top:5%;left:5%;width:90%;height:90%;background:#0a0a0a;color:#eee;border:1px solid #444;z-index:9999;padding:12px;overflow:hidden;";
+  modal.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <span>Terrain atlas — UMAP(cosine) + HDBSCAN on CLS embeddings. Click a point to load its tile.</span>
+      <button id="atlas-close">Close</button>
+    </div>
+    <canvas id="atlas-canvas" width="1200" height="800" style="display:block;margin:8px auto;background:#050505;border:1px solid #222;"></canvas>
+    <div id="atlas-preview" style="position:absolute;right:20px;bottom:20px;background:#111;padding:6px;border:1px solid #333;display:none;">
+      <img id="atlas-preview-img" style="max-width:160px;max-height:160px;display:block;"/>
+      <div id="atlas-preview-cap" style="font-size:0.85em;"></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  document.getElementById("atlas-close").onclick = () => modal.remove();
+
+  const canvas = document.getElementById("atlas-canvas");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
+  const pad = 24;
+
+  function toPixel(p) {
+    return {
+      px: pad + (p.x - minX) / rangeX * (W - 2*pad),
+      py: pad + (p.y - minY) / rangeY * (H - 2*pad),
+    };
+  }
+
+  function clusterColor(cid) {
+    if (cid < 0) return "rgba(120,120,120,0.35)";
+    const h = (cid * 137.5) % 360;
+    return `hsla(${h}, 80%, 60%, 0.8)`;
+  }
+
+  ctx.fillStyle = "#050505";
+  ctx.fillRect(0, 0, W, H);
+  points.forEach(p => {
+    const { px, py } = toPixel(p);
+    ctx.fillStyle = clusterColor(p.cluster_id);
+    ctx.beginPath();
+    ctx.arc(px, py, 2.3, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  canvas.onmousemove = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+    // Nearest-point lookup (brute force is fine for 5k)
+    let best = null, bestD = 64;
+    for (const p of points) {
+      const { px, py } = toPixel(p);
+      const d = (px - mx) ** 2 + (py - my) ** 2;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    const prev = document.getElementById("atlas-preview");
+    if (best) {
+      prev.style.display = "block";
+      document.getElementById("atlas-preview-img").src =
+        `/api/tile?path=${encodeURIComponent(best.image_path)}`;
+      document.getElementById("atlas-preview-cap").innerText =
+        `${best.product_id} • cluster ${best.cluster_id} • scale ${best.tile_scale}`;
+    } else {
+      prev.style.display = "none";
+    }
+  };
+  canvas.onclick = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) * (W / rect.width);
+    const my = (e.clientY - rect.top) * (H / rect.height);
+    let best = null, bestD = 100;
+    for (const p of points) {
+      const { px, py } = toPixel(p);
+      const d = (px - mx) ** 2 + (py - my) ** 2;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    if (best && best.lat !== null && best.lon !== null) {
+      map.setView([best.lat, best.lon], Math.min(map.getMaxZoom(), 4));
+      modal.remove();
+    }
+  };
+}
 
 document.getElementById("surprise-btn").onclick = async () => {
   const btn = document.getElementById("surprise-btn");
@@ -708,9 +875,14 @@ function renderResults(results, scoreCol) {
         <div><b>#${idx + 1}</b> ${r.product_id}</div>
         <div>${scoreCol}: ${r.score?.toFixed(3) ?? "?"}${r.coverage !== null && r.coverage !== undefined ? " • cov " + r.coverage : ""}</div>
         <div>lat ${r.lat?.toFixed(1)} • lon ${r.lon?.toFixed(1)} • scale ${r.tile_scale}</div>
+        <button data-path="${r.image_path}" class="add-positive-btn">+ positive</button>
       </div>
     `;
     el.appendChild(row);
+    row.querySelector(".add-positive-btn").onclick = (ev) => {
+      ev.stopPropagation();
+      addToTray(ev.target.dataset.path);
+    };
 
     if (r.lat !== null && r.lon !== null) {
       const marker = L.circleMarker([r.lat, r.lon], {
