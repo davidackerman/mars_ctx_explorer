@@ -32,6 +32,11 @@ from PIL import Image
 from pydantic import BaseModel
 
 from scientific_pipelines.core.embeddings import DINOv3HFExtractor
+from scientific_pipelines.planetary.mars.ctx.anomaly import (
+    score_and_persist_anomaly,
+    top_k_anomalies,
+)
+from scientific_pipelines.planetary.mars.ctx.atlas import build_atlas, load_atlas
 from scientific_pipelines.planetary.mars.ctx.patch_retrieval import CTXPatchIndex
 from scientific_pipelines.planetary.mars.ctx.retrieval import (
     CTXSimilarityIndex,
@@ -173,6 +178,154 @@ def api_source(product_id: str, max_edge: int = 1600) -> Response:
     )
 
 
+@app.get("/api/atlas")
+def api_atlas(max_points: int = 10000) -> JSONResponse:
+    """Return the UMAP atlas: every tile's 2-D projection + cluster id.
+
+    Lazily computes + caches `atlas.parquet` on first call. Subsequent calls
+    just read the parquet. Clients get a downsample by the ``max_points`` arg
+    (default 10k) to keep the scatter responsive.
+    """
+    index_dir: Path = APP_STATE["index_dir"]
+    atlas_path = index_dir / "atlas.parquet"
+    if not atlas_path.exists():
+        logger.info("No cached atlas; building UMAP now (can take a few minutes)")
+        build_atlas(
+            embeddings_path=index_dir / "embeddings.parquet",
+            metadata_path=index_dir / "metadata.parquet",
+            out_path=atlas_path,
+            max_points=50_000,
+        )
+    df = load_atlas(atlas_path)
+    df = df.dropna(subset=["atlas_x", "atlas_y"])
+    if len(df) > max_points:
+        df = df.sample(max_points, random_state=0)
+    records = []
+    for _, row in df.iterrows():
+        records.append(
+            {
+                "image_path": str(row["image_path"]),
+                "x": float(row["atlas_x"]),
+                "y": float(row["atlas_y"]),
+                "cluster_id": int(row.get("cluster_id") or -1),
+                "product_id": str(row.get("product_id", "") or ""),
+                "tile_scale": int(row.get("tile_scale") or 0),
+                "lat": float(row["approx_lat"]) if pd.notna(row.get("approx_lat")) else None,
+                "lon": float(row["approx_lon"]) if pd.notna(row.get("approx_lon")) else None,
+            }
+        )
+    return JSONResponse({"points": records})
+
+
+class FewShotRequest(BaseModel):
+    positive_paths: List[str]
+    top_k: int = 20
+    tile_scale: Optional[int] = None
+
+
+@app.post("/api/few_shot")
+def api_few_shot(req: FewShotRequest) -> JSONResponse:
+    """Fit a logistic regression using the user's positives vs the rest of the
+    corpus and return the top-k highest-scoring tiles globally.
+    """
+    if not req.positive_paths:
+        raise HTTPException(status_code=400, detail="Need at least one positive_paths entry")
+
+    index: CTXSimilarityIndex = APP_STATE["cls_index"]
+    embeddings_path = APP_STATE["index_dir"] / "embeddings.parquet"
+    if not embeddings_path.exists():
+        raise HTTPException(status_code=500, detail=f"Missing {embeddings_path}")
+    emb_df = pd.read_parquet(embeddings_path).drop_duplicates(
+        subset="image_path", keep="first"
+    )
+
+    # Align embeddings to the index's metadata row order.
+    path_to_row = {str(p): i for i, p in enumerate(emb_df["image_path"].astype(str))}
+    vectors = np.vstack(emb_df["embedding"].values).astype(np.float32)
+    vectors = vectors / np.clip(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-9, None)
+
+    pos_rows = [path_to_row.get(p) for p in req.positive_paths]
+    pos_rows = [r for r in pos_rows if r is not None]
+    if not pos_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="None of the positive_paths are in the index embeddings",
+        )
+
+    y = np.zeros(vectors.shape[0], dtype=np.int32)
+    y[pos_rows] = 1
+
+    from sklearn.linear_model import LogisticRegression
+
+    clf = LogisticRegression(C=1.0, max_iter=200, class_weight="balanced", n_jobs=-1)
+    clf.fit(vectors, y)
+    # clf.decision_function is the raw score; use that for ranking
+    scores = clf.decision_function(vectors).astype(np.float32)
+
+    md = index.metadata
+    md_slim = md[
+        [c for c in ("image_path", "tile_scale", "product_id", "approx_lat", "approx_lon") if c in md.columns]
+    ].drop_duplicates(subset="image_path", keep="first")
+
+    df = pd.DataFrame(
+        {"image_path": emb_df["image_path"].astype(str), "score": scores}
+    ).merge(md_slim, on="image_path", how="left")
+    df = df[~df["image_path"].isin(req.positive_paths)]
+    if req.tile_scale is not None and "tile_scale" in df.columns:
+        df = df[df["tile_scale"] == int(req.tile_scale)]
+    df = df.sort_values("score", ascending=False).head(req.top_k)
+
+    payload = []
+    for _, row in df.iterrows():
+        payload.append(
+            {
+                "image_path": str(row["image_path"]),
+                "product_id": str(row.get("product_id", "") or ""),
+                "tile_scale": int(row.get("tile_scale") or 0),
+                "score": float(row["score"]),
+                "lat": float(row["approx_lat"]) if pd.notna(row.get("approx_lat")) else None,
+                "lon": float(row["approx_lon"]) if pd.notna(row.get("approx_lon")) else None,
+            }
+        )
+    return JSONResponse({"results": payload})
+
+
+@app.get("/api/anomalies")
+def api_anomalies(k: int = 20, tile_scale: Optional[int] = None) -> JSONResponse:
+    """Return the top-k most anomalous tiles.
+
+    Lazily computes + caches the anomaly score parquet on first call; subsequent
+    calls are instant. Higher score = more outlier-ish in CLS-embedding space.
+    """
+    index_dir: Path = APP_STATE["index_dir"]
+    scores_path = index_dir / "anomaly_scores.parquet"
+    if not scores_path.exists():
+        logger.info("No cached anomaly scores; computing now (LOF, k=40)...")
+        score_and_persist_anomaly(
+            embeddings_path=index_dir / "embeddings.parquet",
+            metadata_path=index_dir / "metadata.parquet",
+            out_path=scores_path,
+            method="lof",
+            n_neighbors=40,
+        )
+    df = top_k_anomalies(scores_path, k=k, tile_scale=tile_scale)
+    payload = df.to_dict(orient="records")
+    # numpy dtypes can't serialise natively
+    clean = []
+    for row in payload:
+        clean.append(
+            {
+                "image_path": str(row.get("image_path", "")),
+                "product_id": str(row.get("product_id", "") or ""),
+                "tile_scale": int(row.get("tile_scale") or 0),
+                "anomaly_score": float(row.get("anomaly_score") or 0.0),
+                "lat": float(row["approx_lat"]) if pd.notna(row.get("approx_lat")) else None,
+                "lon": float(row["approx_lon"]) if pd.notna(row.get("approx_lon")) else None,
+            }
+        )
+    return JSONResponse({"anomalies": clean})
+
+
 class QueryRequest(BaseModel):
     crop_png_base64: str
     top_k: int = 12
@@ -296,6 +449,9 @@ VIEWER_HTML = r"""<!doctype html>
   <div id="side">
     <h2>CTX similarity explorer</h2>
     <p class="muted">Click a circle on the map to open its source image. Drag to draw a crop, then hit "Find similar".</p>
+    <div style="margin-bottom: 10px;">
+      <button id="surprise-btn">🔭 Surprise me (top anomalies)</button>
+    </div>
     <div id="selected"></div>
     <h2>Results</h2>
     <div id="results"><p class="muted">Nothing yet.</p></div>
@@ -327,6 +483,55 @@ let sourceOriginalW = 0;
 let sourceOriginalH = 0;
 let previewScale = 1.0;
 let resultMarkers = [];
+
+document.getElementById("surprise-btn").onclick = async () => {
+  const btn = document.getElementById("surprise-btn");
+  btn.disabled = true;
+  btn.innerText = "Scoring anomalies (first time can take ~1 min)...";
+  try {
+    const resp = await fetch("/api/anomalies?k=20");
+    const data = await resp.json();
+    renderAnomalies(data.anomalies);
+  } finally {
+    btn.disabled = false;
+    btn.innerText = "🔭 Surprise me (top anomalies)";
+  }
+};
+
+function renderAnomalies(anomalies) {
+  resultMarkers.forEach(m => map.removeLayer(m));
+  resultMarkers = [];
+  const el = document.getElementById("results");
+  if (!anomalies || !anomalies.length) {
+    el.innerHTML = '<p class="muted">No anomaly scores yet.</p>';
+    return;
+  }
+  el.innerHTML = "<h3>Top anomalies (weirdest tiles)</h3>";
+  anomalies.forEach((a, idx) => {
+    const row = document.createElement("div");
+    row.className = "result";
+    row.innerHTML = `
+      <img src="/api/tile?path=${encodeURIComponent(a.image_path)}" />
+      <div class="meta">
+        <div><b>#${idx + 1}</b> ${a.product_id}</div>
+        <div>anomaly: ${a.anomaly_score.toFixed(3)} • scale ${a.tile_scale}</div>
+        <div>lat ${a.lat?.toFixed(1)} • lon ${a.lon?.toFixed(1)}</div>
+      </div>
+    `;
+    el.appendChild(row);
+    if (a.lat !== null && a.lon !== null) {
+      const marker = L.circleMarker([a.lat, a.lon], {
+        radius: 9,
+        color: "#ffd700",
+        weight: 2,
+        fillColor: "#ffd700",
+        fillOpacity: 0.5,
+      }).addTo(map);
+      marker.bindTooltip(`#${idx + 1} anomaly: ${a.anomaly_score.toFixed(2)}`);
+      resultMarkers.push(marker);
+    }
+  });
+}
 
 fetch("/api/images").then(r => r.json()).then(({ images }) => {
   images.forEach(img => {
