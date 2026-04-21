@@ -178,6 +178,51 @@ def api_source(product_id: str, max_edge: int = 1600) -> Response:
     )
 
 
+@app.post("/api/build_patch_index")
+def api_build_patch_index(product_id: str) -> JSONResponse:
+    """Build (or return cached) per-product patch index.
+
+    Intended for the 'global CLS-only index' workflow: when a user focuses on
+    a specific product, they can opt in to region-level patch queries for
+    just that product. Each per-product patch index is tiny (tens of MB).
+    """
+    index_dir: Path = APP_STATE["index_dir"]
+    patch_dir = index_dir / "patch_by_product" / product_id
+    if (patch_dir / "patches.faiss").exists():
+        return JSONResponse({"product_id": product_id, "status": "cached", "path": str(patch_dir)})
+
+    md: pd.DataFrame = APP_STATE["cls_index"].metadata
+    tiles = md[md["product_id"] == product_id]["image_path"].astype(str).tolist()
+    if not tiles:
+        raise HTTPException(status_code=404, detail=f"No tiles for product_id={product_id}")
+
+    extractor = APP_STATE["extractor"]
+    transform = APP_STATE["transform"]
+
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    extra_meta = md[md["product_id"] == product_id].drop_duplicates(subset="image_path")
+
+    logger.info("Building patch index for %s (%d tiles)", product_id, len(tiles))
+    CTXPatchIndex.build_from_tiles(
+        tile_paths=[Path(p) for p in tiles],
+        extractor=extractor,
+        transform=transform,
+        index_dir=patch_dir,
+        batch_size=32,
+        device="cuda",
+        normalize=True,
+        extra_tile_metadata=extra_meta,
+    )
+    return JSONResponse(
+        {
+            "product_id": product_id,
+            "status": "built",
+            "path": str(patch_dir),
+            "tile_count": len(tiles),
+        }
+    )
+
+
 @app.get("/api/atlas")
 def api_atlas(max_points: int = 10000) -> JSONResponse:
     """Return the UMAP atlas: every tile's 2-D projection + cluster id.
