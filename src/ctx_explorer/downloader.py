@@ -508,6 +508,12 @@ class CTXDownloader:
         cal_cube = img_path.parent / f"{product_id}.cal.cub"
         map_cube = img_path.parent / f"{product_id}.map.cub"
 
+        # Per-step timeouts: a malformed CTX EDR can make cam2map allocate huge
+        # arrays and hang indefinitely (e.g. PDS records with bogus lat/lon
+        # like 99N999W). Bounded timeouts fail such products instead of
+        # blocking the whole pipeline.
+        ISIS_STEP_TIMEOUT = 15 * 60  # 15 minutes per step; cam2map usually <1 min
+
         try:
             # Step 1: Import CTX IMG to ISIS cube format
             logger.info(f"[1/5] mroctx2isis: {img_path.name}")
@@ -516,6 +522,7 @@ class CTXDownloader:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=ISIS_STEP_TIMEOUT,
             )
 
             # Step 2: Add SPICE geometry (spacecraft position/pointing)
@@ -525,6 +532,7 @@ class CTXDownloader:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=ISIS_STEP_TIMEOUT,
             )
 
             # Step 3: Radiometric calibration (optional)
@@ -536,6 +544,7 @@ class CTXDownloader:
                     check=True,
                     capture_output=True,
                     text=True,
+                    timeout=ISIS_STEP_TIMEOUT,
                 )
                 working_cube = cal_cube
             else:
@@ -561,6 +570,7 @@ class CTXDownloader:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=ISIS_STEP_TIMEOUT,
             )
 
             # Step 5: Export to GeoTIFF
@@ -576,6 +586,7 @@ class CTXDownloader:
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=ISIS_STEP_TIMEOUT,
             )
 
             logger.info(f"Successfully processed {img_path.name} through ISIS3 pipeline")
@@ -591,6 +602,16 @@ class CTXDownloader:
         except subprocess.CalledProcessError as e:
             logger.error(f"ISIS3 processing failed for {img_path.name}: {e.stderr}")
             # Clean up partial files
+            for temp_file in [isis_cube, cal_cube, map_cube, tif_path]:
+                if temp_file.exists():
+                    temp_file.unlink()
+            return None
+
+        except subprocess.TimeoutExpired as e:
+            logger.error(
+                f"ISIS3 step timed out (>{ISIS_STEP_TIMEOUT}s) on {img_path.name}; "
+                "likely a malformed PDS record. Cleaning intermediates and skipping."
+            )
             for temp_file in [isis_cube, cal_cube, map_cube, tif_path]:
                 if temp_file.exists():
                     temp_file.unlink()
