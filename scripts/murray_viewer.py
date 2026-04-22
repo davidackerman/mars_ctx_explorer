@@ -20,6 +20,7 @@ import argparse
 import io
 import json
 import logging
+import math
 import os
 from pathlib import Path
 from typing import Optional
@@ -70,19 +71,62 @@ def tile_center_deg(z: int, x: int, y: int) -> tuple[float, float]:
 APP_STATE: dict = {}
 
 
-def _load(index_dir: Path) -> None:
+def _load_single_index(index_dir: Path) -> dict:
     import faiss
 
-    APP_STATE["index_dir"] = index_dir
-    APP_STATE["index"] = faiss.read_index(str(index_dir / "faiss.index"))
-    APP_STATE["metadata"] = pd.read_parquet(index_dir / "metadata.parquet")
     with open(index_dir / "faiss.model.json") as fp:
-        APP_STATE["sidecar"] = json.load(fp)
+        sidecar = json.load(fp)
+    return {
+        "index_dir": index_dir,
+        "index": faiss.read_index(str(index_dir / "faiss.index")),
+        "metadata": pd.read_parquet(index_dir / "metadata.parquet"),
+        "sidecar": sidecar,
+        "zoom": int(sidecar["zoom"]),
+    }
+
+
+def _load(index_root: Path) -> None:
+    """Load one or many indices from ``index_root``.
+
+    - If ``index_root/faiss.index`` exists, treat it as a single-zoom index.
+    - Otherwise scan subdirectories for faiss.index files and register each as
+      a zoom level, enabling multi-scale queries.
+    """
+    indices: dict[int, dict] = {}
+    if (index_root / "faiss.index").exists():
+        state = _load_single_index(index_root)
+        indices[state["zoom"]] = state
+    else:
+        for child in sorted(index_root.iterdir()):
+            if (child / "faiss.index").exists():
+                try:
+                    state = _load_single_index(child)
+                    indices[state["zoom"]] = state
+                    logger.info(
+                        "Registered zoom %d from %s (%d vectors)",
+                        state["zoom"],
+                        child,
+                        state["index"].ntotal,
+                    )
+                except Exception as e:
+                    logger.warning("Skipping %s: %s", child, e)
+    if not indices:
+        raise RuntimeError(f"No FAISS indices found in {index_root}")
+
+    APP_STATE["index_root"] = index_root
+    APP_STATE["indices"] = indices
+    APP_STATE["available_zooms"] = sorted(indices)
+    # Back-compat: point the "current default" at the finest available zoom
+    default_zoom = APP_STATE["available_zooms"][-1]
+    APP_STATE["default_zoom"] = default_zoom
+    APP_STATE["index_dir"] = indices[default_zoom]["index_dir"]
+    APP_STATE["index"] = indices[default_zoom]["index"]
+    APP_STATE["metadata"] = indices[default_zoom]["metadata"]
+    APP_STATE["sidecar"] = indices[default_zoom]["sidecar"]
     logger.info(
-        "Loaded %s with %d vectors (zoom=%d)",
-        index_dir,
-        APP_STATE["index"].ntotal,
-        APP_STATE["sidecar"].get("zoom"),
+        "Multi-scale available zooms: %s (default=%d)",
+        APP_STATE["available_zooms"],
+        default_zoom,
     )
 
     os.environ.setdefault("HF_HOME", "/mnt/bigdisk/hf_cache")
@@ -101,6 +145,33 @@ def _load(index_dir: Path) -> None:
     APP_STATE["session"].headers["User-Agent"] = (
         "mars-astrobio-viewer/0.1 (contact: ackermand@janelia.hhmi.org)"
     )
+
+
+def _select_index_for_bbox(lat_min: float, lat_max: float, lon_min: float, lon_max: float) -> int:
+    """Pick the available zoom whose tile side length best matches the bbox's
+    long edge, in log-space. Favours genuine scale-to-scale matching over the
+    old "always use index_zoom" behaviour.
+    """
+    long_edge_deg = max(lat_max - lat_min, lon_max - lon_min)
+    if long_edge_deg <= 0:
+        return APP_STATE["default_zoom"]
+    target_log = math.log(long_edge_deg)
+    best = APP_STATE["default_zoom"]
+    best_delta = float("inf")
+    for z in APP_STATE["available_zooms"]:
+        tile_deg = TILE_PX * pixel_size_deg(z)
+        delta = abs(math.log(tile_deg) - target_log)
+        if delta < best_delta:
+            best_delta = delta
+            best = z
+    return best
+
+
+def _select_index_for_tile_at_zoom(z: int) -> int:
+    """Pick the best available zoom for a single-tile query at zoom ``z``."""
+    if z in APP_STATE["indices"]:
+        return z
+    return min(APP_STATE["available_zooms"], key=lambda zz: abs(zz - z))
 
 
 def _fetch_and_embed(z: int, x: int, y: int) -> np.ndarray:
@@ -194,9 +265,13 @@ def _embed_pil(img: Image.Image) -> np.ndarray:
     return vec
 
 
-def _search(vec: np.ndarray, top_k: int) -> list[dict]:
-    distances, indices = APP_STATE["index"].search(vec, top_k)
-    md: pd.DataFrame = APP_STATE["metadata"]
+def _search(vec: np.ndarray, top_k: int, zoom: Optional[int] = None) -> list[dict]:
+    state = APP_STATE["indices"][zoom] if zoom in APP_STATE["indices"] else None
+    if state is None:
+        z = APP_STATE["default_zoom"]
+        state = APP_STATE["indices"][z]
+    distances, indices = state["index"].search(vec, top_k)
+    md: pd.DataFrame = state["metadata"]
     results = []
     for dist, idx in zip(distances[0], indices[0]):
         if idx < 0:
@@ -246,21 +321,25 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
     If the caller doesn't specify `zoom`, we pick the finest fetch zoom that
     uses at most 9 tiles to keep network cost bounded.
     """
-    index_zoom = APP_STATE["sidecar"].get("zoom")
+    # Scale-aware: pick the indexed zoom whose tile size best matches the
+    # user's bbox long edge. That way we search tiles at a physical scale
+    # that's comparable to what the user drew, not always at the coarsest
+    # index.
+    search_zoom = _select_index_for_bbox(q.lat_min, q.lat_max, q.lon_min, q.lon_max)
+    # Fetch source pixels at the same zoom (so the query embedding matches
+    # the index's feature scale), but cap by bbox spanning ≤9 tiles.
     if q.zoom is not None:
         fetch_z = q.zoom
     else:
-        # Pick fetch zoom so the bbox spans ≤ ~3 tiles on each side.
-        best_z = index_zoom
-        for candidate in range(index_zoom, 13):
+        fetch_z = search_zoom
+        for candidate in range(search_zoom + 1, 13):
             x0, x1, y0, y1 = _tile_range_for_bbox(
                 candidate, q.lat_min, q.lat_max, q.lon_min, q.lon_max
             )
             n_tiles = (x1 - x0 + 1) * (y1 - y0 + 1)
             if n_tiles > 9:
                 break
-            best_z = candidate
-        fetch_z = best_z
+            fetch_z = candidate
 
     x0, x1, y0, y1 = _tile_range_for_bbox(
         fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
@@ -276,7 +355,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
     )
     vec = _embed_pil(region_img)
-    results = _search(vec, q.top_k)
+    results = _search(vec, q.top_k, zoom=search_zoom)
 
     # Encode the composite crop as a base64 thumbnail for UI preview.
     import base64
@@ -295,6 +374,8 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                     "lon_min": q.lon_min, "lon_max": q.lon_max,
                 },
                 "fetch_z": fetch_z,
+                "search_zoom": search_zoom,
+                "available_zooms": APP_STATE["available_zooms"],
                 "n_tiles": n_tiles,
                 "composite_w": region_img.width,
                 "composite_h": region_img.height,
@@ -307,22 +388,24 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
 
 @app.post("/api/query_latlon")
 def api_query_latlon(q: LatLonQuery) -> JSONResponse:
-    index_zoom = APP_STATE["sidecar"].get("zoom")
-    z = q.zoom if q.zoom is not None else index_zoom
-    if z != index_zoom:
-        logger.info(
-            "Query zoom %d != index zoom %d; proceeding but matches may be scale-mismatched",
-            z,
-            index_zoom,
-        )
-    x, y = latlon_to_tile(q.lat, q.lon, z)
-    vec = _fetch_and_embed(z, x, y)
-    results = _search(vec, q.top_k)
+    # Pick the best-matching zoom we have indexed. If the user specifies one,
+    # snap to the nearest available; otherwise default to the finest zoom.
+    if q.zoom is not None:
+        index_zoom = _select_index_for_tile_at_zoom(q.zoom)
+    else:
+        index_zoom = APP_STATE["default_zoom"]
+    # Fetch source pixels at the indexed zoom so the query vector lives in
+    # the same feature space as the searched tiles.
+    x, y = latlon_to_tile(q.lat, q.lon, index_zoom)
+    vec = _fetch_and_embed(index_zoom, x, y)
+    results = _search(vec, q.top_k, zoom=index_zoom)
     return JSONResponse(
         {
             "query": {
-                "lat": q.lat, "lon": q.lon, "z": z, "x": x, "y": y,
-                "tile_url": TILE_URL.format(z=z, x=x, y=y),
+                "lat": q.lat, "lon": q.lon, "z": index_zoom, "x": x, "y": y,
+                "tile_url": TILE_URL.format(z=index_zoom, x=x, y=y),
+                "index_zoom_used": index_zoom,
+                "available_zooms": APP_STATE["available_zooms"],
             },
             "results": results,
         }
@@ -414,7 +497,7 @@ HTML = r"""<!doctype html>
 
 <script>
 const TILE_URL = "https://astro.arcgis.com/arcgis/rest/services/OnMars/CTX1/MapServer/tile/{z}/{y}/{x}";
-const INDEX_ZOOM = %(INDEX_ZOOM)s;
+const AVAILABLE_ZOOMS = %(AVAILABLE_ZOOMS)s;
 
 const map = L.map("map", {
   crs: L.CRS.EPSG4326,
@@ -449,15 +532,22 @@ map.on("click", async (e) => {
   if (regionMode) return;  // region mode uses mousedown/mouseup, not click
   const { lat, lng } = e.latlng;
   document.getElementById("query").innerHTML =
-    `<p>Querying lat ${lat.toFixed(2)}, lon ${lng.toFixed(2)} at zoom ${INDEX_ZOOM}...</p>`;
+    `<p>Querying lat ${lat.toFixed(2)}, lon ${lng.toFixed(2)} (available zooms: ${AVAILABLE_ZOOMS.join(", ")})...</p>`;
   if (queryMarker) map.removeLayer(queryMarker);
   if (queryRect) { map.removeLayer(queryRect); queryRect = null; }
   queryMarker = L.circleMarker([lat, lng], {radius:10,color:"#7df",weight:2,fillColor:"#7df",fillOpacity:0.5}).addTo(map);
 
+  // Match client's current zoom to one of our index zooms.
+  const leafletZoom = map.getZoom();
+  const requestedZoom = AVAILABLE_ZOOMS.reduce(
+    (best, z) => (Math.abs(z - leafletZoom) < Math.abs(best - leafletZoom) ? z : best),
+    AVAILABLE_ZOOMS[0],
+  );
+
   const resp = await fetch("/api/query_latlon", {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({lat, lon: lng, zoom: INDEX_ZOOM, top_k: 20}),
+    body: JSON.stringify({lat, lon: lng, zoom: requestedZoom, top_k: 20}),
   });
   const data = await resp.json();
   renderQuery(data.query);
@@ -502,7 +592,8 @@ function renderBboxQuery(q) {
   document.getElementById("query").innerHTML = `
     <h3>Query region</h3>
     <img src="data:image/jpeg;base64,${q.preview_b64}" style="width:100%;max-width:400px;border:1px solid #333"/>
-    <p class="muted">${q.composite_w}×${q.composite_h} px composited from ${q.n_tiles} tile(s) at z=${q.fetch_z}</p>
+    <p class="muted">${q.composite_w}×${q.composite_h} px composited from ${q.n_tiles} tile(s) fetched at z=${q.fetch_z}</p>
+    <p class="muted">Searched at z=${q.search_zoom} (available: ${q.available_zooms.join(", ")})</p>
     <p class="muted">bbox: lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}</p>
   `;
 }
@@ -572,7 +663,9 @@ def main() -> None:
 
     _load(args.index_dir)
     global HTML
-    HTML = HTML.replace("%(INDEX_ZOOM)s", str(APP_STATE["sidecar"]["zoom"]))
+    HTML = HTML.replace(
+        "%(AVAILABLE_ZOOMS)s", json.dumps(APP_STATE["available_zooms"])
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -157,9 +157,19 @@ def api_source(product_id: str, max_edge: int = 1600) -> Response:
     tif = source_dir / f"{product_id}.tif"
     if not tif.exists():
         raise HTTPException(status_code=404, detail=f"{tif} not found")
-    # Proper 16-bit → 8-bit percentile stretch so the preview matches the
-    # tiles we indexed (naive PIL convert("RGB") clips high values to white).
-    arr = _load_grayscale_stretched(tif)  # uint8 2-D
+    # 16-bit → 8-bit percentile stretch + CLAHE for display. The base stretch
+    # matches the tiles we indexed; CLAHE is a display-only enhancement that
+    # pulls out local contrast in flat-looking scenes (e.g. volcanic plains)
+    # that a single global stretch can't show.
+    import cv2
+
+    arr = _load_grayscale_stretched(tif)  # uint8 2-D, 0 = NoData
+    mask = arr > 0
+    if mask.any():
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(16, 16))
+        enhanced = clahe.apply(arr)
+        # Keep NoData as black (CLAHE would brighten 0s too)
+        arr = np.where(mask, enhanced, 0).astype(np.uint8)
     img = Image.fromarray(arr, mode="L").convert("RGB")
     w, h = img.size
     scale = min(1.0, max_edge / max(w, h))
@@ -740,13 +750,22 @@ function renderAnomalies(anomalies) {
         fillOpacity: 0.5,
       }).addTo(map);
       marker.bindTooltip(`#${idx + 1} anomaly: ${a.anomaly_score.toFixed(2)}`);
+      const tileBox = parseTileBox(a.image_path);
+      marker.on("click", () => openByProductId(a.product_id, tileBox));
       resultMarkers.push(marker);
     }
+    const tileBox = parseTileBox(a.image_path);
+    row.onclick = () => openByProductId(a.product_id, tileBox);
   });
 }
 
+// Keep a product_id -> image record lookup so anomaly / few-shot / query pins
+// can all navigate to the source product on click.
+const imagesByProductId = new Map();
+
 fetch("/api/images").then(r => r.json()).then(({ images }) => {
   images.forEach(img => {
+    imagesByProductId.set(img.product_id, img);
     if (img.lat === null || img.lon === null) return;
     const marker = L.circleMarker([img.lat, img.lon], {
       radius: 6,
@@ -760,7 +779,24 @@ fetch("/api/images").then(r => r.json()).then(({ images }) => {
   });
 });
 
-function openProduct(img) {
+function openByProductId(product_id, highlight) {
+  const img = imagesByProductId.get(product_id);
+  if (img) openProduct(img, highlight);
+}
+
+// Tile filename → source-image pixel box. Filenames look like
+// "<product>_s0512_tile_004096_000512.png" where s=512 is the tile side and
+// the two 6-digit ints are (y_offset, x_offset) in source-image pixels.
+function parseTileBox(image_path) {
+  const m = image_path.match(/_s(\d{4})_tile_(\d{6})_(\d{6})\.png$/);
+  if (!m) return null;
+  const scale = parseInt(m[1], 10);
+  const y = parseInt(m[2], 10);
+  const x = parseInt(m[3], 10);
+  return { x, y, width: scale, height: scale };
+}
+
+function openProduct(img, highlight) {
   selectedProduct = img;
   const el = document.getElementById("selected");
   el.innerHTML = `
@@ -769,6 +805,7 @@ function openProduct(img) {
     <div id="crop-container">
       <img id="src" src="" alt="" />
       <div id="crop-rect" style="display:none"></div>
+      <div id="highlight-rect" style="display:none;position:absolute;border:3px solid #ffd700;background:rgba(255,215,0,0.10);pointer-events:none;"></div>
     </div>
     <p class="muted">Drag on the image to draw a query crop.</p>
     <button id="go" disabled>Find similar</button>
@@ -780,6 +817,26 @@ function openProduct(img) {
     sourceOriginalH = parseInt(lastHeaders["x-original-height"] || srcImg.naturalHeight);
     previewScale = parseFloat(lastHeaders["x-preview-scale"] || 1.0);
     selectedImg = srcImg;
+
+    if (highlight) {
+      // Convert source-image pixel coords → displayed-preview pixel coords.
+      // The displayed <img> is scaled by the browser to fit the container;
+      // the server-side preview scale is only partial — also account for
+      // display scaling via getBoundingClientRect / naturalWidth.
+      const rect = document.getElementById("highlight-rect");
+      const imgRect = srcImg.getBoundingClientRect();
+      const displayScaleX = imgRect.width / srcImg.naturalWidth;
+      const displayScaleY = imgRect.height / srcImg.naturalHeight;
+      const previewX = highlight.x * previewScale;
+      const previewY = highlight.y * previewScale;
+      const previewW = highlight.width * previewScale;
+      const previewH = highlight.height * previewScale;
+      rect.style.left = (previewX * displayScaleX) + "px";
+      rect.style.top = (previewY * displayScaleY) + "px";
+      rect.style.width = (previewW * displayScaleX) + "px";
+      rect.style.height = (previewH * displayScaleY) + "px";
+      rect.style.display = "block";
+    }
   };
 
   lastHeaders = {};
@@ -938,8 +995,15 @@ function renderResults(results, scoreCol) {
         fillOpacity: 0.4,
       }).addTo(map);
       marker.bindTooltip(`#${idx + 1} ${r.product_id}`);
+      const tileBox = parseTileBox(r.image_path);
+      marker.on("click", () => openByProductId(r.product_id, tileBox));
       resultMarkers.push(marker);
     }
+    const tileBox = parseTileBox(r.image_path);
+    row.onclick = (ev) => {
+      if (ev.target.classList.contains("add-positive-btn")) return;
+      openByProductId(r.product_id, tileBox);
+    };
   });
 }
 </script>
