@@ -117,6 +117,83 @@ def _fetch_and_embed(z: int, x: int, y: int) -> np.ndarray:
     return vec
 
 
+def _tile_range_for_bbox(
+    z: int, lat_min: float, lat_max: float, lon_min: float, lon_max: float
+) -> tuple[int, int, int, int]:
+    """Return (x_min, x_max, y_min, y_max) tile indices covering the bbox."""
+    size = TILE_PX * pixel_size_deg(z)
+    x_min = max(0, int((lon_min + 180.0) / size))
+    x_max = min(2 * (2**z) - 1, int((lon_max + 180.0) / size))
+    y_min = max(0, int((90.0 - lat_max) / size))  # lat_max is north; y small
+    y_max = min(1 * (2**z) - 1, int((90.0 - lat_min) / size))
+    return x_min, x_max, y_min, y_max
+
+
+def _fetch_bbox_composite(
+    z: int, lat_min: float, lat_max: float, lon_min: float, lon_max: float
+) -> Image.Image:
+    """Fetch all tiles intersecting the bbox, composite into one image, then
+    crop to the exact bbox extent so DINO sees just the region the user drew.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    x_min, x_max, y_min, y_max = _tile_range_for_bbox(z, lat_min, lat_max, lon_min, lon_max)
+    n_x = x_max - x_min + 1
+    n_y = y_max - y_min + 1
+    if n_x <= 0 or n_y <= 0:
+        raise HTTPException(status_code=400, detail="Empty bbox")
+
+    session: requests.Session = APP_STATE["session"]
+    canvas = Image.new("RGB", (n_x * TILE_PX, n_y * TILE_PX), (0, 0, 0))
+
+    def fetch_one(x: int, y: int) -> tuple[int, int, Optional[Image.Image]]:
+        url = TILE_URL.format(z=z, x=x, y=y)
+        try:
+            r = session.get(url, timeout=15)
+            if r.status_code == 200:
+                return x, y, Image.open(io.BytesIO(r.content)).convert("RGB")
+        except Exception:
+            pass
+        return x, y, None
+
+    with ThreadPoolExecutor(max_workers=min(16, n_x * n_y)) as pool:
+        futures = [
+            pool.submit(fetch_one, x, y)
+            for y in range(y_min, y_max + 1)
+            for x in range(x_min, x_max + 1)
+        ]
+        for fut in futures:
+            x, y, tile_img = fut.result()
+            if tile_img is None:
+                continue
+            canvas.paste(tile_img, ((x - x_min) * TILE_PX, (y - y_min) * TILE_PX))
+
+    # Convert bbox (deg) → pixel coords inside the composite.
+    px = pixel_size_deg(z)
+    composite_lon0 = -180.0 + x_min * TILE_PX * px  # left edge
+    composite_lat0 = 90.0 - y_min * TILE_PX * px    # top edge
+    crop_x0 = int(round((lon_min - composite_lon0) / px))
+    crop_y0 = int(round((composite_lat0 - lat_max) / px))
+    crop_x1 = int(round((lon_max - composite_lon0) / px))
+    crop_y1 = int(round((composite_lat0 - lat_min) / px))
+    crop_x0 = max(0, min(canvas.width, crop_x0))
+    crop_y0 = max(0, min(canvas.height, crop_y0))
+    crop_x1 = max(crop_x0 + 1, min(canvas.width, crop_x1))
+    crop_y1 = max(crop_y0 + 1, min(canvas.height, crop_y1))
+    return canvas.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+
+
+def _embed_pil(img: Image.Image) -> np.ndarray:
+    import faiss
+
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    tensor = APP_STATE["transform"](img).unsqueeze(0)
+    vec = APP_STATE["extractor"].extract(tensor).astype("float32")
+    faiss.normalize_L2(vec)
+    return vec
+
+
 def _search(vec: np.ndarray, top_k: int) -> list[dict]:
     distances, indices = APP_STATE["index"].search(vec, top_k)
     md: pd.DataFrame = APP_STATE["metadata"]
@@ -148,6 +225,84 @@ class LatLonQuery(BaseModel):
     lon: float
     zoom: Optional[int] = None
     top_k: int = 20
+
+
+class BboxQuery(BaseModel):
+    lat_min: float
+    lat_max: float
+    lon_min: float
+    lon_max: float
+    zoom: Optional[int] = None  # at which zoom to fetch source pixels
+    top_k: int = 20
+
+
+@app.post("/api/query_bbox")
+def api_query_bbox(q: BboxQuery) -> JSONResponse:
+    """Query by an arbitrary geographic region (smaller, equal, or larger than
+    one tile). Fetches all tiles intersecting the bbox at the requested fetch
+    zoom, composites into one image in memory, crops to the exact bbox, runs
+    DINO, and searches the pre-built index.
+
+    If the caller doesn't specify `zoom`, we pick the finest fetch zoom that
+    uses at most 9 tiles to keep network cost bounded.
+    """
+    index_zoom = APP_STATE["sidecar"].get("zoom")
+    if q.zoom is not None:
+        fetch_z = q.zoom
+    else:
+        # Pick fetch zoom so the bbox spans ≤ ~3 tiles on each side.
+        best_z = index_zoom
+        for candidate in range(index_zoom, 13):
+            x0, x1, y0, y1 = _tile_range_for_bbox(
+                candidate, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+            )
+            n_tiles = (x1 - x0 + 1) * (y1 - y0 + 1)
+            if n_tiles > 9:
+                break
+            best_z = candidate
+        fetch_z = best_z
+
+    x0, x1, y0, y1 = _tile_range_for_bbox(
+        fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+    )
+    n_tiles = (x1 - x0 + 1) * (y1 - y0 + 1)
+    if n_tiles > 64:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Region spans {n_tiles} tiles at zoom {fetch_z}; pick a smaller box or lower zoom.",
+        )
+
+    region_img = _fetch_bbox_composite(
+        fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+    )
+    vec = _embed_pil(region_img)
+    results = _search(vec, q.top_k)
+
+    # Encode the composite crop as a base64 thumbnail for UI preview.
+    import base64
+
+    preview_img = region_img.copy()
+    preview_img.thumbnail((512, 512), Image.LANCZOS)
+    buf = io.BytesIO()
+    preview_img.save(buf, format="JPEG", quality=85)
+    preview_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    return JSONResponse(
+        {
+            "query": {
+                "bbox": {
+                    "lat_min": q.lat_min, "lat_max": q.lat_max,
+                    "lon_min": q.lon_min, "lon_max": q.lon_max,
+                },
+                "fetch_z": fetch_z,
+                "n_tiles": n_tiles,
+                "composite_w": region_img.width,
+                "composite_h": region_img.height,
+                "preview_b64": preview_b64,
+            },
+            "results": results,
+        }
+    )
 
 
 @app.post("/api/query_latlon")
@@ -248,7 +403,9 @@ HTML = r"""<!doctype html>
     <p class="muted">Click anywhere on Mars → the tile there is embedded and the top-k most similar tiles globally are pinned. Background = full Murray Lab 5 m mosaic.</p>
     <div style="margin-bottom:10px">
       <button id="surprise">🔭 Surprise me (top anomalies)</button>
+      <button id="mode-toggle">🔲 Region select: OFF</button>
     </div>
+    <p class="muted" id="mode-hint">Click a spot on Mars = query that tile. Toggle region select, then drag a rectangle to query an arbitrary region (smaller or larger than a tile).</p>
     <div id="query"></div>
     <h2>Results</h2>
     <div id="results"><p class="muted">Click anywhere on Mars.</p></div>
@@ -275,12 +432,26 @@ L.tileLayer(TILE_URL, {
 
 let resultMarkers = [];
 let queryMarker = null;
+let queryRect = null;
+let regionMode = false;
+let dragging = null;
+
+const modeBtn = document.getElementById("mode-toggle");
+modeBtn.onclick = () => {
+  regionMode = !regionMode;
+  modeBtn.innerText = regionMode ? "🔲 Region select: ON" : "🔲 Region select: OFF";
+  // Disable map drag while in region mode so mousedown starts a bbox draw.
+  if (regionMode) map.dragging.disable();
+  else map.dragging.enable();
+};
 
 map.on("click", async (e) => {
+  if (regionMode) return;  // region mode uses mousedown/mouseup, not click
   const { lat, lng } = e.latlng;
   document.getElementById("query").innerHTML =
     `<p>Querying lat ${lat.toFixed(2)}, lon ${lng.toFixed(2)} at zoom ${INDEX_ZOOM}...</p>`;
   if (queryMarker) map.removeLayer(queryMarker);
+  if (queryRect) { map.removeLayer(queryRect); queryRect = null; }
   queryMarker = L.circleMarker([lat, lng], {radius:10,color:"#7df",weight:2,fillColor:"#7df",fillOpacity:0.5}).addTo(map);
 
   const resp = await fetch("/api/query_latlon", {
@@ -292,6 +463,49 @@ map.on("click", async (e) => {
   renderQuery(data.query);
   renderResults(data.results || [], "similarity");
 });
+
+map.on("mousedown", (e) => {
+  if (!regionMode) return;
+  dragging = { start: e.latlng, end: e.latlng };
+  if (queryRect) { map.removeLayer(queryRect); queryRect = null; }
+  queryRect = L.rectangle(L.latLngBounds(e.latlng, e.latlng), {
+    color: "#ffe600", weight: 2, fillOpacity: 0.15,
+  }).addTo(map);
+});
+map.on("mousemove", (e) => {
+  if (!regionMode || !dragging || !queryRect) return;
+  dragging.end = e.latlng;
+  queryRect.setBounds(L.latLngBounds(dragging.start, dragging.end));
+});
+map.on("mouseup", async (e) => {
+  if (!regionMode || !dragging) return;
+  const start = dragging.start, end = dragging.end;
+  dragging = null;
+  const lat_min = Math.min(start.lat, end.lat);
+  const lat_max = Math.max(start.lat, end.lat);
+  const lon_min = Math.min(start.lng, end.lng);
+  const lon_max = Math.max(start.lng, end.lng);
+  if (lat_max - lat_min < 1e-4 || lon_max - lon_min < 1e-4) return;  // ignore tiny drags
+  document.getElementById("query").innerHTML =
+    `<p>Querying region (${lat_min.toFixed(2)},${lon_min.toFixed(2)})–(${lat_max.toFixed(2)},${lon_max.toFixed(2)})...</p>`;
+  const resp = await fetch("/api/query_bbox", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({lat_min, lat_max, lon_min, lon_max, top_k: 20}),
+  });
+  const data = await resp.json();
+  renderBboxQuery(data.query);
+  renderResults(data.results || [], "similarity");
+});
+
+function renderBboxQuery(q) {
+  document.getElementById("query").innerHTML = `
+    <h3>Query region</h3>
+    <img src="data:image/jpeg;base64,${q.preview_b64}" style="width:100%;max-width:400px;border:1px solid #333"/>
+    <p class="muted">${q.composite_w}×${q.composite_h} px composited from ${q.n_tiles} tile(s) at z=${q.fetch_z}</p>
+    <p class="muted">bbox: lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}</p>
+  `;
+}
 
 function renderQuery(q) {
   document.getElementById("query").innerHTML = `
