@@ -459,7 +459,15 @@ def api_anomalies(k: int = 20) -> JSONResponse:
         md["anomaly_score"] = all_scores
         md.to_parquet(scores_path, index=False)
         logger.info("Wrote %s in %.0fs", scores_path, _time.time() - t0)
-    df = pd.read_parquet(scores_path).sort_values("anomaly_score", ascending=False).head(k)
+    df = pd.read_parquet(scores_path)
+    # Keep only physically sensible scores. 1 - cosine lives in [0, 2] for
+    # unit vectors; anything outside indicates IVF-PQ reconstruction noise on
+    # degenerate (near-zero-norm) tiles — pure black polar strips etc. Drop
+    # those so the "weirdest tile" list surfaces actual geology, not
+    # numerical garbage.
+    s = df["anomaly_score"]
+    df = df[np.isfinite(s) & (s >= 0.0) & (s <= 2.0)]
+    df = df.sort_values("anomaly_score", ascending=False).head(k)
     payload = []
     for _, row in df.iterrows():
         z_i, x_i, y_i = int(row.z), int(row.x), int(row.y)
