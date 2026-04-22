@@ -460,13 +460,18 @@ def api_anomalies(k: int = 20) -> JSONResponse:
         md.to_parquet(scores_path, index=False)
         logger.info("Wrote %s in %.0fs", scores_path, _time.time() - t0)
     df = pd.read_parquet(scores_path)
-    # Keep only physically sensible scores. 1 - cosine lives in [0, 2] for
-    # unit vectors; anything outside indicates IVF-PQ reconstruction noise on
-    # degenerate (near-zero-norm) tiles — pure black polar strips etc. Drop
-    # those so the "weirdest tile" list surfaces actual geology, not
-    # numerical garbage.
     s = df["anomaly_score"]
-    df = df[np.isfinite(s) & (s >= 0.0) & (s <= 2.0)]
+    # (1) clip to sane cosine-distance range — IVF-PQ reconstruction of
+    #     near-zero-norm tiles can produce inf/huge values.
+    # (2) drop polar latitudes where Murray Lab's plate-carrée tiles are
+    #     severely squashed horizontally. A z10 tile at 80°N represents
+    #     ~3.6 × 20.7 km of ground in the same 512×512 raster as a near-
+    #     equatorial tile's ~20.7 × 20.7 km, so the projection artefact
+    #     dominates DINO features and skews "weirdest tile" toward the
+    #     poles. Keeping |lat| ≤ 70° covers ~94% of Mars surface and
+    #     surfaces actual geology. Remove this once the streaming indexer
+    #     is taught to cos(lat)-crop tiles at embed time.
+    df = df[np.isfinite(s) & (s >= 0.0) & (s <= 2.0) & (df["lat"].abs() <= 70.0)]
     df = df.sort_values("anomaly_score", ascending=False).head(k)
     payload = []
     for _, row in df.iterrows():
