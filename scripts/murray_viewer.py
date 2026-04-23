@@ -980,16 +980,32 @@ viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#2a1a12");
 viewer.scene.requestRenderMode = true;
 viewer.clock.shouldAnimate = false;
 
-// Place the camera at a fixed, sensible Mars-orbit view — explicit Cartesian
-// so we don't depend on Cartesian3.fromDegrees or any ellipsoid default.
-const MARS_VIEW_ALT = 12_000_000;  // ~8600 km above surface, whole disk in frame
+// Hard-freeze the camera: every frame, reset its position + orientation to a
+// fixed orbit view. This is the only way to guarantee no tween, inertia, or
+// internal-controller nudge can move the camera on startup. We keep the
+// freeze on for 3 s, then release so rotate/zoom become interactive.
+const FIXED_POS = new Cesium.Cartesian3(12_000_000, 0, 0);
+const FIXED_DIR = new Cesium.Cartesian3(-1, 0, 0);
+const FIXED_UP = new Cesium.Cartesian3(0, 0, 1);
+function clampCamera() {
+  viewer.camera.position.x = FIXED_POS.x;
+  viewer.camera.position.y = FIXED_POS.y;
+  viewer.camera.position.z = FIXED_POS.z;
+  Cesium.Cartesian3.clone(FIXED_DIR, viewer.camera.direction);
+  Cesium.Cartesian3.clone(FIXED_UP, viewer.camera.up);
+  Cesium.Cartesian3.cross(FIXED_DIR, FIXED_UP, viewer.camera.right);
+  Cesium.Cartesian3.normalize(viewer.camera.right, viewer.camera.right);
+}
 viewer.camera.setView({
-  destination: new Cesium.Cartesian3(MARS_VIEW_ALT, 0, 0),
-  orientation: {
-    direction: new Cesium.Cartesian3(-1, 0, 0),
-    up: new Cesium.Cartesian3(0, 0, 1),
-  },
+  destination: FIXED_POS,
+  orientation: { direction: FIXED_DIR, up: FIXED_UP },
 });
+viewer.scene.screenSpaceCameraController.enableInputs = false;
+const clampListener = viewer.scene.postUpdate.addEventListener(clampCamera);
+setTimeout(() => {
+  clampListener();  // removeEventListener handle returned by addEventListener
+  viewer.scene.screenSpaceCameraController.enableInputs = true;
+}, 3000);
 viewer.scene.requestRender();
 
 let resultEntities = [];
