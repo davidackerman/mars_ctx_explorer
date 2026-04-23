@@ -105,12 +105,37 @@ def _load_single_index(index_dir: Path) -> dict:
     }
 
 
-def _load(index_root: Path) -> None:
+def _load_patch_index(patch_dir: Path) -> dict:
+    import faiss
+
+    with open(patch_dir / "patches.model.json") as fp:
+        sidecar = json.load(fp)
+    index = faiss.read_index(str(patch_dir / "patches.faiss"))
+    if isinstance(index, faiss.IndexIVF):
+        index.nprobe = 64
+        logger.info(
+            "Set nprobe=64 on patch IVF index at %s (nlist=%d)",
+            patch_dir, index.nlist,
+        )
+    return {
+        "index_dir": patch_dir,
+        "index": index,
+        "tiles_df": pd.read_parquet(patch_dir / "tiles.parquet"),
+        "sidecar": sidecar,
+        "zoom": int(sidecar["zoom"]),
+        "num_patches_per_tile": int(sidecar["num_patches_per_tile"]),
+        "patch_grid_n": int(sidecar["patch_grid_n"]),
+    }
+
+
+def _load(index_root: Path, patch_root: Optional[Path] = None) -> None:
     """Load one or many indices from ``index_root``.
 
     - If ``index_root/faiss.index`` exists, treat it as a single-zoom index.
     - Otherwise scan subdirectories for faiss.index files and register each as
       a zoom level, enabling multi-scale queries.
+    - If ``patch_root`` is given, also scan its subdirectories for patch
+      indices (``patches.faiss`` + ``tiles.parquet`` + ``patches.model.json``).
     """
     indices: dict[int, dict] = {}
     if (index_root / "faiss.index").exists():
@@ -132,6 +157,27 @@ def _load(index_root: Path) -> None:
                     logger.warning("Skipping %s: %s", child, e)
     if not indices:
         raise RuntimeError(f"No FAISS indices found in {index_root}")
+
+    patch_indices: dict[int, dict] = {}
+    if patch_root is not None and patch_root.exists():
+        candidates: list[Path] = []
+        if (patch_root / "patches.faiss").exists():
+            candidates.append(patch_root)
+        else:
+            for child in sorted(patch_root.iterdir()):
+                if (child / "patches.faiss").exists():
+                    candidates.append(child)
+        for child in candidates:
+            try:
+                state = _load_patch_index(child)
+                patch_indices[state["zoom"]] = state
+                logger.info(
+                    "Registered patch index zoom %d from %s (%d patches, %d tiles)",
+                    state["zoom"], child, state["index"].ntotal, len(state["tiles_df"]),
+                )
+            except Exception as e:
+                logger.warning("Skipping patch index %s: %s", child, e)
+    APP_STATE["patch_indices"] = patch_indices
 
     APP_STATE["index_root"] = index_root
     APP_STATE["indices"] = indices
@@ -336,6 +382,125 @@ def _embed_pil(img: Image.Image) -> np.ndarray:
     vec = APP_STATE["extractor"].extract(tensor).astype("float32")
     faiss.normalize_L2(vec)
     return vec
+
+
+def _patch_bounds_deg(
+    tile_z: int, tile_x: int, tile_y: int, patch_row: int, patch_col: int, grid_n: int
+) -> tuple[float, float, float, float]:
+    """lat/lon bounds of the (patch_row, patch_col) cell of the `grid_n`x`grid_n`
+    patch grid inside tile (z, x, y). Row 0 = top (highest lat)."""
+    lat_min, lat_max, lon_min, lon_max = tile_bounds_deg(tile_z, tile_x, tile_y)
+    dlat = (lat_max - lat_min) / grid_n
+    dlon = (lon_max - lon_min) / grid_n
+    p_lat_max = lat_max - patch_row * dlat
+    p_lat_min = p_lat_max - dlat
+    p_lon_min = lon_min + patch_col * dlon
+    p_lon_max = p_lon_min + dlon
+    return p_lat_min, p_lat_max, p_lon_min, p_lon_max
+
+
+def _search_patches(
+    lat_min: float, lat_max: float, lon_min: float, lon_max: float,
+    fetch_z: int, search_zoom: int, top_k: int,
+    spatial_diversity: bool = False, diversity_tiles: int = 4,
+) -> list[dict]:
+    """Sub-tile retrieval. Crops the user's bbox, runs DINO patch tokens,
+    searches each query patch against the global patch index, merges hits
+    by (tile_row_id, patch_idx) keeping the max score across query patches.
+
+    Returns a list of patch-level results with tile_url, tile_bounds, and
+    patch_bounds for drawing at patch resolution on the client."""
+    import faiss
+
+    patch_indices = APP_STATE.get("patch_indices", {})
+    state = patch_indices.get(search_zoom)
+    if state is None:
+        # Fall back to the finest available patch zoom.
+        if not patch_indices:
+            raise HTTPException(status_code=503, detail="Patch index not available.")
+        state = patch_indices[max(patch_indices)]
+    tiles_df: pd.DataFrame = state["tiles_df"]
+    patch_index = state["index"]
+    grid_n = state["patch_grid_n"]
+    P = state["num_patches_per_tile"]
+    z_i = state["zoom"]
+    aspect_correct = bool(state["sidecar"].get("aspect_corrected", False))
+
+    region_img = _fetch_bbox_composite(fetch_z, lat_min, lat_max, lon_min, lon_max)
+    if aspect_correct:
+        center_lat = 0.5 * (lat_min + lat_max)
+        cos_lat = max(0.05, math.cos(math.radians(abs(center_lat))))
+        if cos_lat < 0.999:
+            new_w = max(32, int(round(region_img.width * cos_lat)))
+            region_img = region_img.resize((new_w, region_img.height), Image.LANCZOS)
+
+    transform = APP_STATE["transform"]
+    extractor = APP_STATE["extractor"]
+    tensor = transform(region_img).unsqueeze(0)
+    qpatches = extractor.extract_patches(tensor).astype("float32")  # (1, Q, D)
+    Q = int(qpatches.shape[1])
+    D = int(qpatches.shape[2])
+    qvec = qpatches.reshape(Q, D)
+    faiss.normalize_L2(qvec)
+
+    # Search all query patches at once. Faiss returns (Q, per_query_k).
+    per_query_k = max(8, top_k // max(1, Q) * 4)
+    fetch_k = per_query_k * (8 if spatial_diversity else 1)
+    distances, indices = patch_index.search(qvec, fetch_k)
+
+    # Merge: key by (tile_row_id, patch_idx) → best similarity across query patches
+    best: dict[tuple[int, int], float] = {}
+    for qi in range(Q):
+        for score, idx in zip(distances[qi], indices[qi]):
+            if idx < 0:
+                continue
+            tile_row_id = int(idx // P)
+            patch_idx = int(idx % P)
+            key = (tile_row_id, patch_idx)
+            prev = best.get(key)
+            if prev is None or score > prev:
+                best[key] = float(score)
+
+    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
+    out: list[dict] = []
+    seen_tile_and_patch: list[tuple[int, int, int, int, int]] = []  # (z, x, y, pr, pc)
+
+    for (tile_row_id, patch_idx), score in ranked:
+        if tile_row_id >= len(tiles_df):
+            continue
+        row = tiles_df.iloc[tile_row_id]
+        t_z, t_x, t_y = int(row.z), int(row.x), int(row.y)
+        pr, pc = patch_idx // grid_n, patch_idx % grid_n
+        if spatial_diversity:
+            too_close = False
+            for (sz, sx, sy, spr, spc) in seen_tile_and_patch:
+                if sz != t_z:
+                    continue
+                dx = (sx - t_x) * grid_n + (spc - pc)
+                dy = (sy - t_y) * grid_n + (spr - pr)
+                if max(abs(dx), abs(dy)) < diversity_tiles * grid_n:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+            seen_tile_and_patch.append((t_z, t_x, t_y, pr, pc))
+        p_lat_min, p_lat_max, p_lon_min, p_lon_max = _patch_bounds_deg(
+            t_z, t_x, t_y, pr, pc, grid_n
+        )
+        center_lat = 0.5 * (p_lat_min + p_lat_max)
+        center_lon = 0.5 * (p_lon_min + p_lon_max)
+        out.append({
+            "z": t_z, "x": t_x, "y": t_y,
+            "patch_row": pr, "patch_col": pc,
+            "lat": center_lat, "lon": center_lon,
+            "similarity": score,
+            "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
+            "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
+            "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
+        })
+        if len(out) >= top_k:
+            break
+    return out
 
 
 def _nms_spatial(results: list[dict], top_k: int, min_separation_tiles: int) -> list[dict]:
@@ -550,6 +715,17 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 results = _nms_spatial(merged, q.top_k, q.diversity_tiles)
             else:
                 results = merged[: q.top_k]
+        elif mode == "patch":
+            # True sub-tile retrieval against the pre-built global patch
+            # index. Every patch of every tile is a candidate, not just
+            # patches inside top-k CLS tiles. Results are patch rectangles
+            # (~700 m on a side at z10) rather than tile rectangles.
+            results = _search_patches(
+                q.lat_min, q.lat_max, q.lon_min, q.lon_max,
+                fetch_z, search_zoom, q.top_k,
+                spatial_diversity=q.spatial_diversity,
+                diversity_tiles=q.diversity_tiles,
+            )
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
 
@@ -562,7 +738,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
     # Uses DINO patch tokens: compute the mean query-patch vector, score
     # every patch position in each result tile, pick the max. Adds ~3-10 s
     # to the query (one forward pass per result tile).
-    if q.localize and results:
+    if q.localize and results and mode != "patch":
         try:
             # Build query's per-patch embeddings
             if mode == "composite":
@@ -1051,9 +1227,10 @@ GLOBE_HTML = r"""<!doctype html>
       <button id="draw-region-btn">🔲 Draw region</button>
     </div>
     <div id="mode-help" style="display:none;background:#1a1a1a;border:1px solid #333;padding:8px;margin-bottom:8px;font-size:.85em;line-height:1.35">
-      <p><b>composite</b> — all tiles inside your rectangle are stitched into one image; DINO gives one query vector. Matches the <i>overall signature</i> of the scene. Best for "find other places that look like this whole patch."</p>
-      <p><b>aggregate</b> — each constituent tile's own CLS vector is averaged; one search. Matches the <i>average look</i> of the constituents. Best when texture matters but arrangement doesn't.</p>
-      <p><b>multi</b> — one search per constituent tile, results merged by best score. Matches if <i>any piece</i> of your region resembles the hit. Most recall, least precision.</p>
+      <p><b>patch</b> — true sub-tile retrieval. Your region is cropped, split into DINO patches (~700 m each at z10), and every query patch is searched against a pre-built global patch index of every patch of every tile. Results are patch-level rectangles, not full tiles. This is the most accurate mode for finding specific small features.</p>
+      <p><b>composite</b> — all tiles inside your rectangle are stitched into one image; DINO gives one query vector. Matches the <i>overall signature</i> of the scene at tile-resolution results.</p>
+      <p><b>aggregate</b> — each constituent tile's own CLS vector is averaged; one search. Matches the <i>average look</i> of the constituents.</p>
+      <p><b>multi</b> — one search per constituent tile, results merged by best score. Matches if <i>any piece</i> of your region resembles the hit.</p>
       <p><b>Spatial diversity (NMS)</b> — after ranking, suppress hits that share a neighbourhood (within N tiles of another kept hit) so you don't get 20 results all clustered in the same crater field.</p>
       <p><b>Localize within each result</b> — for every top-k hit, run patch-level matching to find the best sub-region inside that tile and draw a yellow highlight box. Adds 3-10 s.</p>
     </div>
@@ -1061,7 +1238,8 @@ GLOBE_HTML = r"""<!doctype html>
       <legend class="muted">Query options</legend>
       <label class="muted" style="display:block;margin-bottom:4px">Region mode:
         <select id="region-query-mode" style="width:100%">
-          <option value="composite" selected>composite — one vector from stitched region</option>
+          <option value="patch" selected>patch — sub-tile matches globally (recommended)</option>
+          <option value="composite">composite — one vector from stitched region</option>
           <option value="aggregate">aggregate — average of tile vectors</option>
           <option value="multi">multi — search each tile, merge</option>
         </select>
@@ -1301,9 +1479,9 @@ function renderResults(results, scoreCol) {
         <div>lat ${r.lat.toFixed(2)} • lon ${r.lon.toFixed(2)}</div>
       </div>`;
 
-    // Draw the matching tile as a translucent rectangle on the globe.
-    // Colour by rank so the top hit pops.
-    const t = r.tile_bounds;  // [latMin, latMax, lonMin, lonMax]
+    // Draw the matching rectangle on the globe. For patch-mode hits we use
+    // the sub-tile patch_bounds so the highlight is ~700 m instead of ~10 km.
+    const t = r.patch_bounds || r.tile_bounds;  // [latMin, latMax, lonMin, lonMax]
     const isAnom = scoreCol === "anomaly_score";
     const baseColor = isAnom
       ? Cesium.Color.GOLD
@@ -1560,11 +1738,16 @@ ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP);
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--index-dir", type=Path, default=Path("outputs/murray_z8_global"))
+    parser.add_argument(
+        "--patch-dir", type=Path, default=Path("outputs/murray_patch_indices"),
+        help="Root containing per-zoom patch-index subdirs (patches.faiss + tiles.parquet). "
+        "If the path doesn't exist we fall back to CLS-only region queries.",
+    )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8503)
     args = parser.parse_args()
 
-    _load(args.index_dir)
+    _load(args.index_dir, patch_root=args.patch_dir)
     global HTML, GLOBE_HTML
     zooms_json = json.dumps(APP_STATE["available_zooms"])
     HTML = HTML.replace("%(AVAILABLE_ZOOMS)s", zooms_json)
