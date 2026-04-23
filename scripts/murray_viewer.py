@@ -1075,7 +1075,11 @@ const marsEllipsoid = new Cesium.Ellipsoid(MARS_EQ, MARS_EQ, MARS_POLAR);
 // frozen constant; Cesium.Ellipsoid.default (1.117+) is the writable knob.
 Cesium.Ellipsoid.default = marsEllipsoid;
 Cesium.Ion.defaultAccessToken = "";
-const TILE_URL = "https://astro.arcgis.com/arcgis/rest/services/OnMars/CTX1/MapServer/tile/{z}/{y}/{x}";
+// Route Cesium imagery through our own proxy so requests inherit the
+// server-side retry/backoff policy and — crucially — come from the same
+// origin as the page, avoiding the intermittent missing-CORS-header
+// failures we see hitting astro.arcgis.com directly under load.
+const TILE_URL = "/api/tile_img?z={z}&x={x}&y={y}";
 const AVAILABLE_ZOOMS = %(AVAILABLE_ZOOMS)s;
 
 const tilingScheme = new Cesium.GeographicTilingScheme({
@@ -1366,20 +1370,25 @@ function setQueryRect(latMin, lonMin, latMax, lonMax) {
 }
 
 const ssh = viewer.screenSpaceEventHandler;
-const SHIFT = Cesium.KeyboardEventModifier.SHIFT;
 
-// Shift+LEFT_DOWN starts a region-select drag. Cesium only fires this
-// when Shift is held, so unmodified drags still rotate the globe.
+// Track shift state ourselves — Cesium's modifier-aware setInputAction is
+// unreliable in practice (doesn't always classify LEFT_DOWN as shifted).
+let shiftHeld = false;
+window.addEventListener("keydown", (e) => { if (e.key === "Shift") shiftHeld = true; });
+window.addEventListener("keyup", (e) => { if (e.key === "Shift") shiftHeld = false; });
+window.addEventListener("blur", () => { shiftHeld = false; });
+
+// LEFT_DOWN: if Shift is held, start a region-select drag (otherwise let
+// Cesium handle camera rotation normally).
 ssh.setInputAction((evt) => {
+  if (!shiftHeld) return;
   const p = pickLatLon(evt.position);
   if (!p) return;
-  // Freeze the camera for the duration of the drag so the rectangle doesn't
-  // fight with a rotate. Re-enabled on LEFT_UP.
   viewer.scene.screenSpaceCameraController.enableInputs = false;
   cesiumContainer.style.cursor = "crosshair";
   dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
   setQueryRect(p.lat, p.lon, p.lat, p.lon);
-}, Cesium.ScreenSpaceEventType.LEFT_DOWN, SHIFT);
+}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
 
 // Click-to-query on LEFT_CLICK (fires on release, so plain drags to rotate
 // don't fire queries). If a region is staged, the click first clears the
@@ -1498,7 +1507,6 @@ function finishRegionDrag() {
   };
 }
 ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP);
-ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP, SHIFT);
 </script>
 </body></html>
 """
