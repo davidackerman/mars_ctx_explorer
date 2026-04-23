@@ -654,6 +654,18 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             diversity_tiles=q.diversity_tiles,
         )
         preview_img = region_img.copy()
+    elif mode == "patch":
+        # True sub-tile retrieval against the pre-built global patch index.
+        # Every patch of every tile is a candidate.
+        results = _search_patches(
+            q.lat_min, q.lat_max, q.lon_min, q.lon_max,
+            fetch_z, search_zoom, q.top_k,
+            spatial_diversity=q.spatial_diversity,
+            diversity_tiles=q.diversity_tiles,
+        )
+        preview_img = _fetch_bbox_composite(
+            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        )
     else:
         # Fetch each intersecting tile at the SEARCH zoom (not the fetch
         # zoom). Each constituent tile is embedded on its own, so we see
@@ -715,17 +727,6 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 results = _nms_spatial(merged, q.top_k, q.diversity_tiles)
             else:
                 results = merged[: q.top_k]
-        elif mode == "patch":
-            # True sub-tile retrieval against the pre-built global patch
-            # index. Every patch of every tile is a candidate, not just
-            # patches inside top-k CLS tiles. Results are patch rectangles
-            # (~700 m on a side at z10) rather than tile rectangles.
-            results = _search_patches(
-                q.lat_min, q.lat_max, q.lon_min, q.lon_max,
-                fetch_z, search_zoom, q.top_k,
-                spatial_diversity=q.spatial_diversity,
-                diversity_tiles=q.diversity_tiles,
-            )
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
 
