@@ -660,9 +660,16 @@ def root() -> str:
 
 
 @app.get("/globe", response_class=HTMLResponse)
-def globe() -> str:
+def globe() -> HTMLResponse:
     """3D Mars globe viewer (CesiumJS + Murray Lab imagery on Mars ellipsoid)."""
-    return GLOBE_HTML
+    return HTMLResponse(
+        content=GLOBE_HTML,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 HTML = r"""<!doctype html>
@@ -980,32 +987,60 @@ viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#2a1a12");
 viewer.scene.requestRenderMode = true;
 viewer.clock.shouldAnimate = false;
 
-// Hard-freeze the camera: every frame, reset its position + orientation to a
-// fixed orbit view. This is the only way to guarantee no tween, inertia, or
-// internal-controller nudge can move the camera on startup. We keep the
-// freeze on for 3 s, then release so rotate/zoom become interactive.
+// Force coarse LOD so the globe renders in essentially one pass at load —
+// no progressive "sharpening" of imagery tiles that can read as approach.
+viewer.scene.globe.maximumScreenSpaceError = 4;
+
+// Zero out all camera-controller inertia. Without this, any pre-Cesium
+// browser wheel/scroll energy bleeds into a decaying zoom over ~2-3 s
+// that looks exactly like a continuous approach.
+const cc = viewer.scene.screenSpaceCameraController;
+cc.inertiaSpin = 0;
+cc.inertiaTranslate = 0;
+cc.inertiaZoom = 0;
+cc.enableCollisionDetection = false;
+
+// Hard-freeze the camera: every frame just BEFORE rendering, reset its
+// position + orientation to a fixed orbit view. preRender is the last
+// scene event before the draw, so no tween/controller nudge can sneak in
+// after us. We hold the freeze for 3 s then release so the user can
+// rotate/zoom with the mouse.
 const FIXED_POS = new Cesium.Cartesian3(12_000_000, 0, 0);
 const FIXED_DIR = new Cesium.Cartesian3(-1, 0, 0);
 const FIXED_UP = new Cesium.Cartesian3(0, 0, 1);
+const FIXED_RIGHT = new Cesium.Cartesian3();
+Cesium.Cartesian3.cross(FIXED_DIR, FIXED_UP, FIXED_RIGHT);
+Cesium.Cartesian3.normalize(FIXED_RIGHT, FIXED_RIGHT);
 function clampCamera() {
-  viewer.camera.position.x = FIXED_POS.x;
-  viewer.camera.position.y = FIXED_POS.y;
-  viewer.camera.position.z = FIXED_POS.z;
+  Cesium.Cartesian3.clone(FIXED_POS, viewer.camera.position);
   Cesium.Cartesian3.clone(FIXED_DIR, viewer.camera.direction);
   Cesium.Cartesian3.clone(FIXED_UP, viewer.camera.up);
-  Cesium.Cartesian3.cross(FIXED_DIR, FIXED_UP, viewer.camera.right);
-  Cesium.Cartesian3.normalize(viewer.camera.right, viewer.camera.right);
+  Cesium.Cartesian3.clone(FIXED_RIGHT, viewer.camera.right);
 }
 viewer.camera.setView({
   destination: FIXED_POS,
   orientation: { direction: FIXED_DIR, up: FIXED_UP },
 });
-viewer.scene.screenSpaceCameraController.enableInputs = false;
-const clampListener = viewer.scene.postUpdate.addEventListener(clampCamera);
+cc.enableInputs = false;
+const removePre = viewer.scene.preRender.addEventListener(clampCamera);
+const removePost = viewer.scene.postUpdate.addEventListener(clampCamera);
 setTimeout(() => {
-  clampListener();  // removeEventListener handle returned by addEventListener
-  viewer.scene.screenSpaceCameraController.enableInputs = true;
+  removePre();
+  removePost();
+  cc.enableInputs = true;
 }, 3000);
+
+// Tiny debug HUD so we can see, live, whether the camera is moving. If
+// these numbers stay constant but the globe still appears to approach,
+// the visual change is imagery LOD (the surface sharpening), not camera.
+const hud = document.createElement("div");
+hud.style.cssText = "position:absolute;top:4px;left:4px;padding:4px 8px;background:#000a;color:#0f0;font:12px monospace;z-index:9999;pointer-events:none";
+document.getElementById("cesiumContainer").appendChild(hud);
+viewer.scene.postRender.addEventListener(() => {
+  const p = viewer.camera.position;
+  const r = Math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z);
+  hud.textContent = `cam ${(p.x/1e6).toFixed(3)}, ${(p.y/1e6).toFixed(3)}, ${(p.z/1e6).toFixed(3)} Mm · r=${(r/1e6).toFixed(3)} Mm · alt=${((r - MARS_EQ)/1e6).toFixed(3)} Mm`;
+});
 viewer.scene.requestRender();
 
 let resultEntities = [];
