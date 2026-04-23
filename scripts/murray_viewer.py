@@ -335,6 +335,7 @@ class BboxQuery(BaseModel):
     zoom: Optional[int] = None  # at which zoom to fetch source pixels
     top_k: int = 20
     mode: str = "composite"  # "composite" | "aggregate" | "multi"
+    localize: bool = False  # find best sub-region within each result tile
 
 
 @app.post("/api/query_bbox")
@@ -458,6 +459,72 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         preview_img = _fetch_bbox_composite(
             fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
+
+    # Optional: localize where within each result tile the query best matches.
+    # Uses DINO patch tokens: compute the mean query-patch vector, score
+    # every patch position in each result tile, pick the max. Adds ~3-10 s
+    # to the query (one forward pass per result tile).
+    if q.localize and results:
+        try:
+            # Build query's per-patch embeddings
+            if mode == "composite":
+                q_img_for_patches = region_img
+            else:
+                # Re-composite for patch extraction when we didn't keep one
+                q_img_for_patches = _fetch_bbox_composite(
+                    fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+                )
+                if aspect_correct_query:
+                    cl = 0.5 * (q.lat_min + q.lat_max)
+                    cos_ = max(0.05, math.cos(math.radians(abs(cl))))
+                    if cos_ < 0.999:
+                        q_img_for_patches = q_img_for_patches.resize(
+                            (max(32, int(round(q_img_for_patches.width * cos_))),
+                             q_img_for_patches.height),
+                            Image.LANCZOS,
+                        )
+            q_tensor = APP_STATE["transform"](q_img_for_patches).unsqueeze(0)
+            q_patches = APP_STATE["extractor"].extract_patches(q_tensor)[0]  # (P, D)
+            q_patches /= np.clip(np.linalg.norm(q_patches, axis=1, keepdims=True), 1e-9, None)
+            q_mean = q_patches.mean(axis=0)
+            q_mean /= max(1e-9, float(np.linalg.norm(q_mean)))
+
+            for r in results:
+                try:
+                    url = TILE_URL.format(z=r["z"], x=r["x"], y=r["y"])
+                    resp = APP_STATE["session"].get(url, timeout=15)
+                    if resp.status_code != 200:
+                        continue
+                    tile_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+                    if aspect_correct_query:
+                        tile_img = _apply_aspect_correction(
+                            tile_img, tile_center_deg(r["z"], r["x"], r["y"])[0]
+                        )
+                    t_tensor = APP_STATE["transform"](tile_img).unsqueeze(0)
+                    t_patches = APP_STATE["extractor"].extract_patches(t_tensor)[0]  # (P, D)
+                    t_patches /= np.clip(
+                        np.linalg.norm(t_patches, axis=1, keepdims=True), 1e-9, None
+                    )
+                    sims = t_patches @ q_mean  # (P,)
+                    grid_n = int(round(math.sqrt(t_patches.shape[0])))
+                    best_idx = int(np.argmax(sims))
+                    row = best_idx // grid_n
+                    col = best_idx % grid_n
+                    # In the displayed thumbnail coord system (512 px ref),
+                    # each patch is 512/grid_n px. Client scales these to
+                    # however large it renders the thumb.
+                    cell = 512.0 / grid_n
+                    r["best_patch_bbox"] = [
+                        int(col * cell),
+                        int(row * cell),
+                        int((col + 1) * cell),
+                        int((row + 1) * cell),
+                    ]
+                    r["best_patch_sim"] = float(sims[best_idx])
+                except Exception as exc:
+                    logger.warning("localize failed for %s: %s", r, exc)
+        except Exception as exc:
+            logger.warning("localize path failed: %s", exc)
 
     preview_img.thumbnail((512, 512), Image.LANCZOS)
     buf = io.BytesIO()
@@ -630,6 +697,10 @@ HTML = r"""<!doctype html>
           <option value="multi">multi — search each constituent, merge (matches ANY piece of region)</option>
         </select>
       </label>
+      <label class="muted" style="display:block;margin-top:4px">
+        <input type="checkbox" id="region-localize"/>
+        Localize WITHIN each result tile (highlights best-matching sub-region; +3-10 s)
+      </label>
     </div>
     <p class="muted" id="mode-hint">Click a spot on Mars = query that tile. Toggle region select, then drag a rectangle to query an arbitrary region (smaller or larger than a tile).</p>
     <div id="query"></div>
@@ -723,10 +794,11 @@ map.on("mouseup", async (e) => {
   document.getElementById("query").innerHTML =
     `<p>Querying region (${lat_min.toFixed(2)},${lon_min.toFixed(2)})–(${lat_max.toFixed(2)},${lon_max.toFixed(2)})...</p>`;
   const queryMode = document.getElementById("region-query-mode").value;
+  const localize = document.getElementById("region-localize").checked;
   const resp = await fetch("/api/query_bbox", {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({lat_min, lat_max, lon_min, lon_max, top_k: 20, mode: queryMode}),
+    body: JSON.stringify({lat_min, lat_max, lon_min, lon_max, top_k: 20, mode: queryMode, localize}),
   });
   const data = await resp.json();
   renderBboxQuery(data.query);
@@ -761,11 +833,22 @@ function renderResults(results, scoreCol) {
     const row = document.createElement("div");
     row.className = "result";
     const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
+    const bbox = r.best_patch_bbox;
+    const hl = bbox
+      ? `<div style="position:absolute;left:${bbox[0]/512*100}%;top:${bbox[1]/512*100}%;width:${(bbox[2]-bbox[0])/512*100}%;height:${(bbox[3]-bbox[1])/512*100}%;border:2px solid #ffe600;box-shadow:0 0 6px rgba(255,230,0,.6);pointer-events:none"></div>`
+      : "";
+    const matchNote = r.best_patch_sim
+      ? `<div class="muted">sub-region sim: ${r.best_patch_sim.toFixed(3)}</div>`
+      : "";
     row.innerHTML = `
-      <img src="${r.tile_url}" loading="lazy"/>
+      <div style="position:relative;width:80px;height:80px;flex:none">
+        <img src="${r.tile_url}" loading="lazy" style="width:100%;height:100%;object-fit:cover;border:1px solid #333"/>
+        ${hl}
+      </div>
       <div class="meta">
         <div><b>#${idx + 1}</b></div>
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
+        ${matchNote}
         <div>lat ${r.lat.toFixed(2)} • lon ${r.lon.toFixed(2)}</div>
         <div class="muted">z=${r.z} • (${r.x},${r.y})</div>
       </div>`;
