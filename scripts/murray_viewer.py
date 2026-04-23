@@ -927,7 +927,23 @@ GLOBE_HTML = r"""<!doctype html>
   <div id="cesiumContainer"></div>
   <div id="side">
     <h2>3D Mars globe</h2>
-    <p class="muted">Left-click anywhere on Mars → that tile is embedded and top-k similar tiles are pinned. The basemap is the full Murray Lab 5 m mosaic draped on the Mars ellipsoid.</p>
+    <p class="muted">Left-click = tile-level similar. Toggle region-select, then drag a rectangle on the globe for arbitrary sub-tile queries.</p>
+    <div style="margin-bottom:10px">
+      <button id="mode-toggle">🔲 Region select: OFF</button>
+    </div>
+    <div id="region-mode-panel" style="margin-bottom:10px;display:none">
+      <label class="muted">Region-query mode:
+        <select id="region-query-mode">
+          <option value="composite" selected>composite — one vector from stitched region</option>
+          <option value="aggregate">aggregate — average of constituent tile vectors</option>
+          <option value="multi">multi — search each constituent, merge</option>
+        </select>
+      </label>
+      <label class="muted" style="display:block;margin-top:4px">
+        <input type="checkbox" id="region-localize"/>
+        Localize WITHIN each result tile (+3-10 s)
+      </label>
+    </div>
     <p class="muted"><a href="/">← back to 2D viewer</a></p>
     <div id="query"></div>
     <h2>Results</h2>
@@ -1133,14 +1149,103 @@ function renderResults(results, scoreCol) {
   });
 }
 
-viewer.screenSpaceEventHandler.setInputAction((evt) => {
-  const cartesian = viewer.camera.pickEllipsoid(evt.position, marsEllipsoid);
-  if (!cartesian) return;
+// ---- Region-select (drag a rectangle on the globe) --------------------- //
+let regionMode = false;
+let dragState = null;  // {startLat, startLon, endLat, endLon}
+let queryRectEntity = null;
+const modeBtn = document.getElementById("mode-toggle");
+const regionModePanel = document.getElementById("region-mode-panel");
+const cesiumContainer = document.getElementById("cesiumContainer");
+
+function pickLatLon(windowPos) {
+  const cartesian = viewer.camera.pickEllipsoid(windowPos, marsEllipsoid);
+  if (!cartesian) return null;
   const carto = marsEllipsoid.cartesianToCartographic(cartesian);
-  const lat = Cesium.Math.toDegrees(carto.latitude);
-  const lon = Cesium.Math.toDegrees(carto.longitude);
-  queryLatLon(lat, lon);
-}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+  return {
+    lat: Cesium.Math.toDegrees(carto.latitude),
+    lon: Cesium.Math.toDegrees(carto.longitude),
+  };
+}
+
+function setQueryRect(latMin, lonMin, latMax, lonMax) {
+  if (queryRectEntity) viewer.entities.remove(queryRectEntity);
+  queryRectEntity = viewer.entities.add({
+    rectangle: {
+      coordinates: Cesium.Rectangle.fromDegrees(lonMin, latMin, lonMax, latMax),
+      material: Cesium.Color.YELLOW.withAlpha(0.2),
+      outline: true,
+      outlineColor: Cesium.Color.YELLOW,
+      height: 0,
+    },
+  });
+  viewer.scene.requestRender();
+}
+
+modeBtn.onclick = () => {
+  regionMode = !regionMode;
+  modeBtn.innerText = regionMode ? "🔲 Region select: ON" : "🔲 Region select: OFF";
+  regionModePanel.style.display = regionMode ? "block" : "none";
+  // Disable globe pan/rotate while drawing; re-enable on toggle off.
+  viewer.scene.screenSpaceCameraController.enableInputs = !regionMode;
+  cesiumContainer.style.cursor = regionMode ? "crosshair" : "default";
+};
+
+const ssh = viewer.screenSpaceEventHandler;
+
+ssh.setInputAction((evt) => {
+  if (regionMode) {
+    const p = pickLatLon(evt.position);
+    if (!p) return;
+    dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
+    setQueryRect(p.lat, p.lon, p.lat, p.lon);
+    return;
+  }
+  // Click-to-query (tile-level).
+  const p = pickLatLon(evt.position);
+  if (!p) return;
+  queryLatLon(p.lat, p.lon);
+}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+ssh.setInputAction((evt) => {
+  if (!regionMode || !dragState) return;
+  const p = pickLatLon(evt.endPosition);
+  if (!p) return;
+  dragState.endLat = p.lat;
+  dragState.endLon = p.lon;
+  setQueryRect(
+    Math.min(dragState.startLat, p.lat),
+    Math.min(dragState.startLon, p.lon),
+    Math.max(dragState.startLat, p.lat),
+    Math.max(dragState.startLon, p.lon),
+  );
+}, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+
+ssh.setInputAction(async (evt) => {
+  if (!regionMode || !dragState) return;
+  const d = dragState;
+  dragState = null;
+  const latMin = Math.min(d.startLat, d.endLat);
+  const latMax = Math.max(d.startLat, d.endLat);
+  const lonMin = Math.min(d.startLon, d.endLon);
+  const lonMax = Math.max(d.startLon, d.endLon);
+  if (latMax - latMin < 1e-4 || lonMax - lonMin < 1e-4) return;
+  document.getElementById("query").innerHTML =
+    `<p>Querying region (${latMin.toFixed(2)},${lonMin.toFixed(2)})–(${latMax.toFixed(2)},${lonMax.toFixed(2)})…</p>`;
+  const queryMode = document.getElementById("region-query-mode").value;
+  const localize = document.getElementById("region-localize").checked;
+  const resp = await fetch("/api/query_bbox", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      lat_min: latMin, lat_max: latMax,
+      lon_min: lonMin, lon_max: lonMax,
+      top_k: 20, mode: queryMode, localize: localize,
+    }),
+  });
+  const data = await resp.json();
+  renderQuery(data.query);
+  renderResults(data.results || [], "similarity");
+}, Cesium.ScreenSpaceEventType.LEFT_UP);
 </script>
 </body></html>
 """
