@@ -213,21 +213,25 @@ TILE_CACHE: dict[tuple[int, int, int], bytes] = {}
 TILE_CACHE_MAX = 4096
 
 
-def _fetch_tile_bytes(z: int, x: int, y: int) -> bytes:
+def _fetch_tile_bytes(z: int, x: int, y: int, max_attempts: int = 6) -> bytes:
     """Fetch raw tile bytes, cached in-memory, with retries+backoff for the
-    transient 429/500/503 storm we see while the patch indexer is running."""
+    transient 429/500/503 storm we see while the patch indexer is running.
+
+    max_attempts=6 (default) is the long-retry path for query-side embedding
+    where we really need the tile. Cesium imagery hits use max_attempts=2
+    so one missing tile doesn't stall LOD loading; Cesium will reschedule
+    the failed tile on its own later anyway."""
     key = (z, x, y)
     cached = TILE_CACHE.get(key)
     if cached is not None:
         return cached
     url = TILE_URL.format(z=z, x=x, y=y)
     last_status = "no response"
-    for attempt in range(6):
+    for attempt in range(max_attempts):
         try:
             r = APP_STATE["session"].get(url, timeout=20)
             if r.status_code == 200:
                 if len(TILE_CACHE) >= TILE_CACHE_MAX:
-                    # crude FIFO trim: drop ~10% of entries
                     for k in list(TILE_CACHE.keys())[: TILE_CACHE_MAX // 10]:
                         TILE_CACHE.pop(k, None)
                 TILE_CACHE[key] = r.content
@@ -235,9 +239,7 @@ def _fetch_tile_bytes(z: int, x: int, y: int) -> bytes:
             last_status = r.status_code
         except requests.RequestException as e:
             last_status = f"exception:{type(e).__name__}"
-        # Longer, capped exponential backoff — ArcGIS 500s happen in bursts
-        # several seconds long when the patch indexer is saturating it.
-        time.sleep(min(6.0, 0.5 * (2 ** attempt)))
+        time.sleep(min(4.0, 0.4 * (2 ** attempt)))
     raise HTTPException(status_code=502, detail=f"Tile fetch failed after retries: {last_status}")
 
 
@@ -752,8 +754,10 @@ def api_anomalies(k: int = 20) -> JSONResponse:
 def api_tile_img(z: int, x: int, y: int) -> Response:
     """Proxy Murray Lab tiles through the server so clients inherit our
     retry/backoff policy and don't hit ArcGIS directly while the patch
-    indexer is saturating the upstream rate limit."""
-    content = _fetch_tile_bytes(z, x, y)
+    indexer is saturating the upstream rate limit. Fast path: 2 attempts
+    only, so one bad tile doesn't stall Cesium LOD loading (Cesium will
+    reschedule a failed imagery tile on its own)."""
+    content = _fetch_tile_bytes(z, x, y, max_attempts=2)
     return Response(
         content=content,
         media_type="image/jpeg",
@@ -1137,9 +1141,11 @@ viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#2a1a12");
 viewer.scene.requestRenderMode = true;
 viewer.clock.shouldAnimate = false;
 
-// Force coarse LOD so the globe renders in essentially one pass at load —
-// no progressive "sharpening" of imagery tiles that can read as approach.
-viewer.scene.globe.maximumScreenSpaceError = 4;
+// Default Cesium SSE is 2 (sharpest). Keep at 2 so zoom-in actually
+// requests higher-resolution tiles instead of stopping at a coarse level.
+viewer.scene.globe.maximumScreenSpaceError = 2;
+// Allow more concurrent imagery requests so LOD fills in faster.
+Cesium.RequestScheduler.maximumRequestsPerServer = 24;
 
 // Zero out all camera-controller inertia. Without this, any pre-Cesium
 // browser wheel/scroll energy bleeds into a decaying zoom over ~2-3 s
