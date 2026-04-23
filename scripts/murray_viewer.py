@@ -1063,10 +1063,10 @@ def main() -> None:
     args = parser.parse_args()
 
     _load(args.index_dir)
-    global HTML
-    HTML = HTML.replace(
-        "%(AVAILABLE_ZOOMS)s", json.dumps(APP_STATE["available_zooms"])
-    )
+    global HTML, GLOBE_HTML
+    zooms_json = json.dumps(APP_STATE["available_zooms"])
+    HTML = HTML.replace("%(AVAILABLE_ZOOMS)s", zooms_json)
+    GLOBE_HTML = GLOBE_HTML.replace("%(AVAILABLE_ZOOMS)s", zooms_json)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
