@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -201,9 +202,20 @@ def _fetch_and_embed(z: int, x: int, y: int, aspect_correct: bool = False) -> np
     import faiss
 
     url = TILE_URL.format(z=z, x=x, y=y)
-    r = APP_STATE["session"].get(url, timeout=15)
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Tile fetch failed: HTTP {r.status_code}")
+    # The background patch indexer hammers ArcGIS; interactive queries lose
+    # occasional tile fetches to 429/503. Retry a few times with backoff.
+    r = None
+    for attempt in range(4):
+        try:
+            r = APP_STATE["session"].get(url, timeout=15)
+            if r.status_code == 200:
+                break
+        except requests.RequestException:
+            r = None
+        time.sleep(0.4 * (attempt + 1))
+    if r is None or r.status_code != 200:
+        status = "no response" if r is None else r.status_code
+        raise HTTPException(status_code=502, detail=f"Tile fetch failed after retries: {status}")
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
     if aspect_correct:
         img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
@@ -1095,21 +1107,45 @@ async function queryLatLon(lat, lon) {
     point: { pixelSize: 12, color: Cesium.Color.CYAN.withAlpha(0.7), outlineColor: Cesium.Color.WHITE, outlineWidth: 1 },
   });
   const leafletZoomApprox = Math.max(...AVAILABLE_ZOOMS);
-  const resp = await fetch("/api/query_latlon", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({lat, lon, zoom: leafletZoomApprox, top_k: 20}),
-  });
-  const data = await resp.json();
-  renderQuery(data.query);
-  renderResults(data.results || [], "similarity");
+  try {
+    const resp = await fetch("/api/query_latlon", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({lat, lon, zoom: leafletZoomApprox, top_k: 20}),
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      document.getElementById("query").innerHTML =
+        `<p style="color:#f88">Query failed (HTTP ${resp.status}): ${err.slice(0,200)}</p>`;
+      return;
+    }
+    const data = await resp.json();
+    if (!data.query) {
+      document.getElementById("query").innerHTML = `<p style="color:#f88">Empty response from server.</p>`;
+      return;
+    }
+    renderQuery(data.query);
+    renderResults(data.results || [], "similarity");
+  } catch (e) {
+    document.getElementById("query").innerHTML = `<p style="color:#f88">Network error: ${e.message}</p>`;
+  }
 }
 
 function renderQuery(q) {
-  document.getElementById("query").innerHTML = `
-    <h3>Query tile</h3>
-    <img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>
-    <p class="muted">z=${q.z} • tile (${q.x},${q.y}) • lat ${q.lat.toFixed(2)} lon ${q.lon.toFixed(2)}</p>`;
+  if (!q) {
+    document.getElementById("query").innerHTML = `<p style="color:#f88">Empty query response.</p>`;
+    return;
+  }
+  const preview = q.tile_url
+    ? `<img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>`
+    : (q.preview_png_b64 ? `<img src="data:image/png;base64,${q.preview_png_b64}" style="width:100%;max-width:320px;border:1px solid #333"/>` : "");
+  const loc = (q.z !== undefined && q.x !== undefined)
+    ? `z=${q.z} • tile (${q.x},${q.y})`
+    : (q.bbox ? `bbox lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}` : "");
+  const ll = (q.lat !== undefined && q.lon !== undefined)
+    ? ` • lat ${q.lat.toFixed(2)} lon ${q.lon.toFixed(2)}`
+    : "";
+  document.getElementById("query").innerHTML = `<h3>Query</h3>${preview}<p class="muted">${loc}${ll}</p>`;
 }
 
 function renderResults(results, scoreCol) {
@@ -1193,18 +1229,21 @@ modeBtn.onclick = () => {
 const ssh = viewer.screenSpaceEventHandler;
 
 ssh.setInputAction((evt) => {
-  if (regionMode) {
-    const p = pickLatLon(evt.position);
-    if (!p) return;
-    dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
-    setQueryRect(p.lat, p.lon, p.lat, p.lon);
-    return;
-  }
-  // Click-to-query (tile-level).
+  if (!regionMode) return;
+  const p = pickLatLon(evt.position);
+  if (!p) return;
+  dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
+  setQueryRect(p.lat, p.lon, p.lat, p.lon);
+}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+
+// Click-to-query (tile-level) fires on LEFT_CLICK, not LEFT_DOWN, so camera
+// drags don't accidentally launch a query on mouse-press.
+ssh.setInputAction((evt) => {
+  if (regionMode) return;
   const p = pickLatLon(evt.position);
   if (!p) return;
   queryLatLon(p.lat, p.lon);
-}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
 ssh.setInputAction((evt) => {
   if (!regionMode || !dragState) return;
