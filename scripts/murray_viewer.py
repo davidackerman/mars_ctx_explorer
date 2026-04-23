@@ -659,6 +659,12 @@ def root() -> str:
     return HTML
 
 
+@app.get("/globe", response_class=HTMLResponse)
+def globe() -> str:
+    """3D Mars globe viewer (CesiumJS + Murray Lab imagery on Mars ellipsoid)."""
+    return GLOBE_HTML
+
+
 HTML = r"""<!doctype html>
 <html><head>
 <meta charset="utf-8"/>
@@ -876,6 +882,174 @@ document.getElementById("surprise").onclick = async () => {
     btn.disabled = false; btn.innerText = "🔭 Surprise me (top anomalies)";
   }
 };
+</script>
+</body></html>
+"""
+
+
+GLOBE_HTML = r"""<!doctype html>
+<html><head>
+<meta charset="utf-8"/>
+<title>Mars CTX 3D globe</title>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js"></script>
+<style>
+  html, body, #layout { height: 100%; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #000; color: #eee; }
+  #layout { display: grid; grid-template-columns: 2fr 1fr; }
+  #cesiumContainer { width: 100%; height: 100%; }
+  #side { overflow-y: auto; padding: 12px; background: #111; border-left: 1px solid #333; }
+  h2 { margin: 6px 0; font-size: 1.05em; }
+  .muted { color: #888; font-size: .85em; }
+  .result { display: flex; gap: 8px; padding: 6px 4px; border-bottom: 1px solid #222; cursor: pointer; }
+  .result:hover { background: #1c1c1c; }
+  .result img { width: 80px; height: 80px; object-fit: cover; border: 1px solid #333; }
+  .result .meta { font-size: .85em; line-height: 1.3; }
+  button { background: #244; color: #eee; border: 1px solid #466; padding: 6px 10px; cursor: pointer; }
+  a { color: #6fb7ff; }
+</style>
+</head><body>
+<div id="layout">
+  <div id="cesiumContainer"></div>
+  <div id="side">
+    <h2>3D Mars globe</h2>
+    <p class="muted">Left-click anywhere on Mars → that tile is embedded and top-k similar tiles are pinned. The basemap is the full Murray Lab 5 m mosaic draped on the Mars ellipsoid.</p>
+    <p class="muted"><a href="/">← back to 2D viewer</a></p>
+    <div id="query"></div>
+    <h2>Results</h2>
+    <div id="results"><p class="muted">Click anywhere on Mars.</p></div>
+  </div>
+</div>
+<script>
+// Mars ellipsoid (MOLA IAU2000): equatorial 3396190 m, polar 3376200 m.
+const MARS_EQ = 3396190.0;
+const MARS_POLAR = 3376200.0;
+Cesium.Ellipsoid.WGS84 = Cesium.Ellipsoid.fromCartesian3(
+  new Cesium.Cartesian3(MARS_EQ, MARS_EQ, MARS_POLAR)
+);
+// Silence Cesium Ion — we don't use their default imagery.
+Cesium.Ion.defaultAccessToken = "";
+const TILE_URL = "https://astro.arcgis.com/arcgis/rest/services/OnMars/CTX1/MapServer/tile/{z}/{y}/{x}";
+const AVAILABLE_ZOOMS = %(AVAILABLE_ZOOMS)s;
+
+const marsEllipsoid = new Cesium.Ellipsoid(MARS_EQ, MARS_EQ, MARS_POLAR);
+const tilingScheme = new Cesium.GeographicTilingScheme({
+  ellipsoid: marsEllipsoid,
+  rectangle: Cesium.Rectangle.fromDegrees(-180, -90, 180, 90),
+  numberOfLevelZeroTilesX: 2,
+  numberOfLevelZeroTilesY: 1,
+});
+const imagery = new Cesium.UrlTemplateImageryProvider({
+  url: TILE_URL,
+  tileWidth: 512,
+  tileHeight: 512,
+  maximumLevel: 14,
+  minimumLevel: 0,
+  tilingScheme: tilingScheme,
+  credit: "NASA/JPL/MSSS/The Murray Lab (Dickson et al. 2024)",
+});
+
+const viewer = new Cesium.Viewer("cesiumContainer", {
+  baseLayerPicker: false,
+  geocoder: false,
+  timeline: false,
+  animation: false,
+  infoBox: false,
+  selectionIndicator: false,
+  shouldAnimate: false,
+  homeButton: false,
+  sceneModePicker: false,
+  navigationHelpButton: false,
+  imageryProvider: imagery,
+  terrainProvider: new Cesium.EllipsoidTerrainProvider({ ellipsoid: marsEllipsoid }),
+  skyBox: false,
+  skyAtmosphere: false,
+});
+viewer.scene.globe.showGroundAtmosphere = false;
+viewer.scene.backgroundColor = Cesium.Color.BLACK;
+viewer.scene.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(0, 0, 7_000_000),
+});
+
+let resultEntities = [];
+let queryEntity = null;
+
+function clearResults() {
+  resultEntities.forEach(e => viewer.entities.remove(e));
+  resultEntities = [];
+}
+
+async function queryLatLon(lat, lon) {
+  document.getElementById("query").innerHTML =
+    `<p>Querying lat ${lat.toFixed(2)}, lon ${lon.toFixed(2)}…</p>`;
+  if (queryEntity) viewer.entities.remove(queryEntity);
+  queryEntity = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lon, lat),
+    point: { pixelSize: 12, color: Cesium.Color.CYAN.withAlpha(0.7), outlineColor: Cesium.Color.WHITE, outlineWidth: 1 },
+  });
+  const leafletZoomApprox = Math.max(...AVAILABLE_ZOOMS);
+  const resp = await fetch("/api/query_latlon", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({lat, lon, zoom: leafletZoomApprox, top_k: 20}),
+  });
+  const data = await resp.json();
+  renderQuery(data.query);
+  renderResults(data.results || [], "similarity");
+}
+
+function renderQuery(q) {
+  document.getElementById("query").innerHTML = `
+    <h3>Query tile</h3>
+    <img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>
+    <p class="muted">z=${q.z} • tile (${q.x},${q.y}) • lat ${q.lat.toFixed(2)} lon ${q.lon.toFixed(2)}</p>`;
+}
+
+function renderResults(results, scoreCol) {
+  clearResults();
+  const el = document.getElementById("results");
+  if (!results.length) { el.innerHTML = "<p class='muted'>No hits.</p>"; return; }
+  el.innerHTML = "";
+  results.forEach((r, idx) => {
+    const row = document.createElement("div");
+    row.className = "result";
+    const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
+    row.innerHTML = `
+      <img src="${r.tile_url}" loading="lazy"/>
+      <div class="meta">
+        <div><b>#${idx + 1}</b></div>
+        <div>${scoreCol}: ${score?.toFixed(3)}</div>
+        <div>lat ${r.lat.toFixed(2)} • lon ${r.lon.toFixed(2)}</div>
+      </div>`;
+    row.onclick = () => {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000),
+      });
+    };
+    el.appendChild(row);
+    const ent = viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(r.lon, r.lat),
+      point: {
+        pixelSize: 10,
+        color: scoreCol === "anomaly_score"
+          ? Cesium.Color.GOLD.withAlpha(0.8)
+          : Cesium.Color.fromCssColorString("#ff6b9a").withAlpha(0.8),
+        outlineColor: Cesium.Color.BLACK,
+        outlineWidth: 1,
+      },
+    });
+    resultEntities.push(ent);
+  });
+}
+
+viewer.screenSpaceEventHandler.setInputAction((evt) => {
+  const cartesian = viewer.camera.pickEllipsoid(evt.position, marsEllipsoid);
+  if (!cartesian) return;
+  const carto = marsEllipsoid.cartesianToCartographic(cartesian);
+  const lat = Cesium.Math.toDegrees(carto.latitude);
+  const lon = Cesium.Math.toDegrees(carto.longitude);
+  queryLatLon(lat, lon);
+}, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 </script>
 </body></html>
 """
