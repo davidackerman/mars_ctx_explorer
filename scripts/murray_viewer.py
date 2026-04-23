@@ -629,17 +629,16 @@ def api_anomalies(k: int = 20) -> JSONResponse:
         logger.info("Wrote %s in %.0fs", scores_path, _time.time() - t0)
     df = pd.read_parquet(scores_path)
     s = df["anomaly_score"]
-    # (1) clip to sane cosine-distance range — IVF-PQ reconstruction of
-    #     near-zero-norm tiles can produce inf/huge values.
-    # (2) drop polar latitudes where Murray Lab's plate-carrée tiles are
-    #     severely squashed horizontally. A z10 tile at 80°N represents
-    #     ~3.6 × 20.7 km of ground in the same 512×512 raster as a near-
-    #     equatorial tile's ~20.7 × 20.7 km, so the projection artefact
-    #     dominates DINO features and skews "weirdest tile" toward the
-    #     poles. Keeping |lat| ≤ 70° covers ~94% of Mars surface and
-    #     surfaces actual geology. Remove this once the streaming indexer
-    #     is taught to cos(lat)-crop tiles at embed time.
-    df = df[np.isfinite(s) & (s >= 0.0) & (s <= 2.0) & (df["lat"].abs() <= 70.0)]
+    # Clip to sane cosine-distance range only — IVF-PQ reconstruction of
+    # near-zero-norm tiles can produce inf/huge numeric garbage. We do NOT
+    # filter by latitude: polar results stay in. The correct fix for the
+    # plate-carrée squash at high latitudes is the cos(lat) aspect
+    # correction applied at embed time (see stream_murray_index.fetch_tile).
+    # Indexes built without aspect correction (sidecar
+    # aspect_corrected=False) will surface polar tiles prominently in
+    # anomaly lists for that reason; rebuilding them with correction is the
+    # proper remedy.
+    df = df[np.isfinite(s) & (s >= 0.0) & (s <= 2.0)]
     df = df.sort_values("anomaly_score", ascending=False).head(k)
     payload = []
     for _, row in df.iterrows():
