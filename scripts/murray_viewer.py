@@ -209,25 +209,43 @@ def _apply_aspect_correction(img: Image.Image, lat_center: float) -> Image.Image
     return img.resize((new_w, h), Image.LANCZOS)
 
 
+TILE_CACHE: dict[tuple[int, int, int], bytes] = {}
+TILE_CACHE_MAX = 4096
+
+
+def _fetch_tile_bytes(z: int, x: int, y: int) -> bytes:
+    """Fetch raw tile bytes, cached in-memory, with retries+backoff for the
+    transient 429/500/503 storm we see while the patch indexer is running."""
+    key = (z, x, y)
+    cached = TILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    url = TILE_URL.format(z=z, x=x, y=y)
+    last_status = "no response"
+    for attempt in range(6):
+        try:
+            r = APP_STATE["session"].get(url, timeout=20)
+            if r.status_code == 200:
+                if len(TILE_CACHE) >= TILE_CACHE_MAX:
+                    # crude FIFO trim: drop ~10% of entries
+                    for k in list(TILE_CACHE.keys())[: TILE_CACHE_MAX // 10]:
+                        TILE_CACHE.pop(k, None)
+                TILE_CACHE[key] = r.content
+                return r.content
+            last_status = r.status_code
+        except requests.RequestException as e:
+            last_status = f"exception:{type(e).__name__}"
+        # Longer, capped exponential backoff — ArcGIS 500s happen in bursts
+        # several seconds long when the patch indexer is saturating it.
+        time.sleep(min(6.0, 0.5 * (2 ** attempt)))
+    raise HTTPException(status_code=502, detail=f"Tile fetch failed after retries: {last_status}")
+
+
 def _fetch_and_embed(z: int, x: int, y: int, aspect_correct: bool = False) -> np.ndarray:
     import faiss
 
-    url = TILE_URL.format(z=z, x=x, y=y)
-    # The background patch indexer hammers ArcGIS; interactive queries lose
-    # occasional tile fetches to 429/503. Retry a few times with backoff.
-    r = None
-    for attempt in range(4):
-        try:
-            r = APP_STATE["session"].get(url, timeout=15)
-            if r.status_code == 200:
-                break
-        except requests.RequestException:
-            r = None
-        time.sleep(0.4 * (attempt + 1))
-    if r is None or r.status_code != 200:
-        status = "no response" if r is None else r.status_code
-        raise HTTPException(status_code=502, detail=f"Tile fetch failed after retries: {status}")
-    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    content = _fetch_tile_bytes(z, x, y)
+    img = Image.open(io.BytesIO(content)).convert("RGB")
     if aspect_correct:
         img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
     tensor = APP_STATE["transform"](img).unsqueeze(0)
@@ -266,14 +284,11 @@ def _fetch_bbox_composite(
     canvas = Image.new("RGB", (n_x * TILE_PX, n_y * TILE_PX), (0, 0, 0))
 
     def fetch_one(x: int, y: int) -> tuple[int, int, Optional[Image.Image]]:
-        url = TILE_URL.format(z=z, x=x, y=y)
         try:
-            r = session.get(url, timeout=15)
-            if r.status_code == 200:
-                return x, y, Image.open(io.BytesIO(r.content)).convert("RGB")
+            content = _fetch_tile_bytes(z, x, y)
+            return x, y, Image.open(io.BytesIO(content)).convert("RGB")
         except Exception:
-            pass
-        return x, y, None
+            return x, y, None
 
     with ThreadPoolExecutor(max_workers=min(16, n_x * n_y)) as pool:
         futures = [
@@ -738,21 +753,10 @@ def api_tile_img(z: int, x: int, y: int) -> Response:
     """Proxy Murray Lab tiles through the server so clients inherit our
     retry/backoff policy and don't hit ArcGIS directly while the patch
     indexer is saturating the upstream rate limit."""
-    url = TILE_URL.format(z=z, x=x, y=y)
-    r = None
-    for attempt in range(4):
-        try:
-            r = APP_STATE["session"].get(url, timeout=15)
-            if r.status_code == 200:
-                break
-        except requests.RequestException:
-            r = None
-        time.sleep(0.3 * (attempt + 1))
-    if r is None or r.status_code != 200:
-        raise HTTPException(status_code=502, detail="Upstream tile fetch failed after retries")
+    content = _fetch_tile_bytes(z, x, y)
     return Response(
-        content=r.content,
-        media_type=r.headers.get("content-type", "image/jpeg"),
+        content=content,
+        media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
@@ -1030,7 +1034,10 @@ GLOBE_HTML = r"""<!doctype html>
   <div id="cesiumContainer"></div>
   <div id="side">
     <h2>3D Mars globe</h2>
-    <p class="muted"><b>Click</b> = query that tile. <b>Shift+drag</b> = draw a rectangle and query an arbitrary region. <a href="#" id="mode-help-link">[what do the modes mean?]</a></p>
+    <p class="muted"><b>Click</b> = query that tile. <b>Draw region</b> (button below) → one drag → rectangle staged for querying. <a href="#" id="mode-help-link">[what do the modes mean?]</a></p>
+    <div style="margin-bottom:8px">
+      <button id="draw-region-btn">🔲 Draw region</button>
+    </div>
     <div id="mode-help" style="display:none;background:#1a1a1a;border:1px solid #333;padding:8px;margin-bottom:8px;font-size:.85em;line-height:1.35">
       <p><b>composite</b> — all tiles inside your rectangle are stitched into one image; DINO gives one query vector. Matches the <i>overall signature</i> of the scene. Best for "find other places that look like this whole patch."</p>
       <p><b>aggregate</b> — each constituent tile's own CLS vector is averaged; one search. Matches the <i>average look</i> of the constituents. Best when texture matters but arrangement doesn't.</p>
@@ -1371,21 +1378,25 @@ function setQueryRect(latMin, lonMin, latMax, lonMax) {
 
 const ssh = viewer.screenSpaceEventHandler;
 
-// Track shift state ourselves — Cesium's modifier-aware setInputAction is
-// unreliable in practice (doesn't always classify LEFT_DOWN as shifted).
-let shiftHeld = false;
-window.addEventListener("keydown", (e) => { if (e.key === "Shift") shiftHeld = true; });
-window.addEventListener("keyup", (e) => { if (e.key === "Shift") shiftHeld = false; });
-window.addEventListener("blur", () => { shiftHeld = false; });
+// "Arm" a single region-drag via the Draw region button. Next drag becomes
+// a region-select; it auto-disarms on mouseup so the very next drag goes
+// back to rotating the camera.
+let regionArmed = false;
+const drawBtn = document.getElementById("draw-region-btn");
+function setArmed(armed) {
+  regionArmed = armed;
+  drawBtn.innerText = armed ? "⏳ Draw one drag…" : "🔲 Draw region";
+  drawBtn.style.background = armed ? "#644" : "#244";
+  cesiumContainer.style.cursor = armed ? "crosshair" : "default";
+}
+drawBtn.onclick = () => setArmed(!regionArmed);
+window.addEventListener("keydown", (e) => { if (e.key === "Escape" && regionArmed) setArmed(false); });
 
-// LEFT_DOWN: if Shift is held, start a region-select drag (otherwise let
-// Cesium handle camera rotation normally).
 ssh.setInputAction((evt) => {
-  if (!shiftHeld) return;
+  if (!regionArmed) return;
   const p = pickLatLon(evt.position);
   if (!p) return;
   viewer.scene.screenSpaceCameraController.enableInputs = false;
-  cesiumContainer.style.cursor = "crosshair";
   dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
   setQueryRect(p.lat, p.lon, p.lat, p.lon);
 }, Cesium.ScreenSpaceEventType.LEFT_DOWN);
@@ -1484,7 +1495,7 @@ function finishRegionDrag() {
   const d = dragState;
   dragState = null;
   viewer.scene.screenSpaceCameraController.enableInputs = true;
-  cesiumContainer.style.cursor = "default";
+  setArmed(false);
   const latMin = Math.min(d.startLat, d.endLat);
   const latMax = Math.max(d.startLat, d.endLat);
   const lonMin = Math.min(d.startLon, d.endLon);
