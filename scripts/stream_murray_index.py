@@ -123,14 +123,45 @@ class TileItem:
     err: Optional[str] = None
 
 
-def fetch_tile(session: requests.Session, z: int, x: int, y: int, timeout: float = 15.0) -> TileItem:
+def fetch_tile(
+    session: requests.Session,
+    z: int,
+    x: int,
+    y: int,
+    timeout: float = 15.0,
+    correct_aspect: bool = True,
+) -> TileItem:
+    """Fetch a tile and (optionally) undo plate-carrée horizontal stretch.
+
+    Murray Lab's tiles are plate-carrée: a 512×512 raster at latitude φ
+    represents cos(φ)·W × W km on the ground. Features get "fatter" by
+    1/cos(φ) horizontally toward the poles — a circular crater at 60° looks
+    like a 2:1 ellipse to DINO. Left uncorrected, the embedding at high
+    latitude is dominated by this artefact.
+
+    With ``correct_aspect=True`` we resample the tile to
+    (int(512 · cos(φ)), 512) pixels before handing it downstream. Now both
+    axes represent the same km/pixel; DINO's standard 224×224 resize (which
+    happens in the transform) stretches that corrected raster back up
+    proportionally, so features have the right shape regardless of latitude.
+    Pixels below lat ~85° survive; above that we clamp cos(lat) ≥ 0.05 to
+    avoid degenerate 1-column tiles.
+    """
     url = TILE_URL.format(z=z, x=x, y=y)
     try:
         resp = session.get(url, timeout=timeout)
         if resp.status_code != 200:
             return TileItem(z, x, y, None, f"HTTP {resp.status_code}")
         img = Image.open(io.BytesIO(resp.content)).convert("RGB")
-        arr = np.asarray(img)  # (512, 512, 3) uint8
+        if correct_aspect:
+            import math
+
+            lat_center = tile_center_deg(z, x, y)[0]
+            cos_lat = max(0.05, math.cos(math.radians(abs(lat_center))))
+            if cos_lat < 0.999:
+                new_w = max(32, int(round(TILE_PX * cos_lat)))
+                img = img.resize((new_w, TILE_PX), Image.LANCZOS)
+        arr = np.asarray(img)
         return TileItem(z, x, y, arr)
     except Exception as e:
         return TileItem(z, x, y, None, str(e))
@@ -193,7 +224,7 @@ def run(
         for z, x, y in subset:
             if stop_flag.is_set():
                 return
-            item = fetch_tile(sess, z, x, y)
+            item = fetch_tile(sess, z, x, y, correct_aspect=True)
             tile_queue.put(item)
         tile_queue.put(None)  # poison pill per worker
 
@@ -229,10 +260,12 @@ def run(
         nonlocal training_done, index, total_ingested
         if not pending_images:
             return
-        images_np = np.stack(pending_images, axis=0)  # (B, 512, 512, 3)
-        # Transform → (B, 3, H, W) tensor
+        # With aspect correction enabled, tiles come in with varying widths
+        # (cos(lat) * 512), so we can't np.stack them. Apply transform
+        # per-image — transform resizes to 224×224 so the resulting tensors
+        # are all the same shape and stack cleanly.
         batch_tensors = []
-        for arr in images_np:
+        for arr in pending_images:
             pil = Image.fromarray(arr, mode="RGB")
             batch_tensors.append(transform(pil))
         batch = torch.stack(batch_tensors, dim=0)
@@ -325,6 +358,7 @@ def run(
         "pq_bytes": pq_bytes,
         "nlist": effective_nlist if training_done else None,
         "tile_px": TILE_PX,
+        "aspect_corrected": True,
     }
     import json
 

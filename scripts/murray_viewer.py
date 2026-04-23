@@ -174,7 +174,30 @@ def _select_index_for_tile_at_zoom(z: int) -> int:
     return min(APP_STATE["available_zooms"], key=lambda zz: abs(zz - z))
 
 
-def _fetch_and_embed(z: int, x: int, y: int) -> np.ndarray:
+def _index_is_aspect_corrected(zoom: int) -> bool:
+    """Did the index at this zoom level get built with cos(lat) correction?
+
+    Critical: applying correction at query time when the index wasn't built
+    that way (or vice versa) puts query and index in different feature
+    spaces and degrades results. We read the flag from each per-zoom
+    sidecar.
+    """
+    state = APP_STATE["indices"].get(zoom)
+    if state is None:
+        return False
+    return bool(state["sidecar"].get("aspect_corrected", False))
+
+
+def _apply_aspect_correction(img: Image.Image, lat_center: float) -> Image.Image:
+    cos_lat = max(0.05, math.cos(math.radians(abs(lat_center))))
+    if cos_lat >= 0.999:
+        return img
+    w, h = img.size
+    new_w = max(32, int(round(w * cos_lat)))
+    return img.resize((new_w, h), Image.LANCZOS)
+
+
+def _fetch_and_embed(z: int, x: int, y: int, aspect_correct: bool = False) -> np.ndarray:
     import faiss
 
     url = TILE_URL.format(z=z, x=x, y=y)
@@ -182,6 +205,8 @@ def _fetch_and_embed(z: int, x: int, y: int) -> np.ndarray:
     if r.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Tile fetch failed: HTTP {r.status_code}")
     img = Image.open(io.BytesIO(r.content)).convert("RGB")
+    if aspect_correct:
+        img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
     tensor = APP_STATE["transform"](img).unsqueeze(0)
     vec = APP_STATE["extractor"].extract(tensor).astype("float32")
     faiss.normalize_L2(vec)
@@ -309,6 +334,7 @@ class BboxQuery(BaseModel):
     lon_max: float
     zoom: Optional[int] = None  # at which zoom to fetch source pixels
     top_k: int = 20
+    mode: str = "composite"  # "composite" | "aggregate" | "multi"
 
 
 @app.post("/api/query_bbox")
@@ -351,16 +377,88 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             detail=f"Region spans {n_tiles} tiles at zoom {fetch_z}; pick a smaller box or lower zoom.",
         )
 
-    region_img = _fetch_bbox_composite(
-        fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
-    )
-    vec = _embed_pil(region_img)
-    results = _search(vec, q.top_k, zoom=search_zoom)
+    mode = (q.mode or "composite").lower()
+    aspect_correct_query = _index_is_aspect_corrected(search_zoom)
+    import base64, faiss
 
-    # Encode the composite crop as a base64 thumbnail for UI preview.
-    import base64
+    if mode == "composite":
+        # One forward pass over the entire composited region → one query
+        # vector. Matches "this whole region's overall signature."
+        region_img = _fetch_bbox_composite(
+            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        )
+        if aspect_correct_query:
+            center_lat = 0.5 * (q.lat_min + q.lat_max)
+            cos_lat = max(0.05, math.cos(math.radians(abs(center_lat))))
+            if cos_lat < 0.999:
+                new_w = max(32, int(round(region_img.width * cos_lat)))
+                region_img = region_img.resize(
+                    (new_w, region_img.height), Image.LANCZOS
+                )
+        vec = _embed_pil(region_img)
+        results = _search(vec, q.top_k, zoom=search_zoom)
+        preview_img = region_img.copy()
+    else:
+        # Fetch each intersecting tile at the SEARCH zoom (not the fetch
+        # zoom). Each constituent tile is embedded on its own, so we see
+        # multiple sub-region vectors instead of one averaged signature.
+        sx0, sx1, sy0, sy1 = _tile_range_for_bbox(
+            search_zoom, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        )
+        tiles_xy = [
+            (x, y) for y in range(sy0, sy1 + 1) for x in range(sx0, sx1 + 1)
+        ]
+        if len(tiles_xy) > 64:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Region spans {len(tiles_xy)} tiles at search zoom "
+                f"{search_zoom}; pick a smaller bbox.",
+            )
+        vecs = []
+        for tx, ty in tiles_xy:
+            try:
+                v = _fetch_and_embed(
+                    search_zoom, tx, ty, aspect_correct=aspect_correct_query
+                )
+                vecs.append(v[0])
+            except HTTPException:
+                continue
+        if not vecs:
+            raise HTTPException(
+                status_code=502, detail="No constituent tiles fetched."
+            )
+        vecs_np = np.stack(vecs, axis=0).astype("float32")
 
-    preview_img = region_img.copy()
+        if mode == "aggregate":
+            # Mean-pool the constituent tile vectors, re-normalize, one
+            # search. "Characteristic average of what's in this region."
+            mean_vec = vecs_np.mean(axis=0, keepdims=True)
+            faiss.normalize_L2(mean_vec)
+            results = _search(mean_vec, q.top_k, zoom=search_zoom)
+        elif mode == "multi":
+            # Run one search per constituent, merge by best similarity per
+            # result row_id. "Anywhere that looks like ANY piece of this
+            # region." More recall-y, less precise.
+            all_hits: dict[tuple, dict] = {}
+            for v in vecs_np:
+                hits = _search(
+                    v.reshape(1, -1), q.top_k, zoom=search_zoom
+                )
+                for h in hits:
+                    key = (h["z"], h["x"], h["y"])
+                    if key not in all_hits or h["similarity"] > all_hits[key]["similarity"]:
+                        all_hits[key] = h
+            results = sorted(
+                all_hits.values(), key=lambda h: h["similarity"], reverse=True
+            )[: q.top_k]
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
+
+        # Build a preview image showing the constituent tiles stitched.
+        preview_img = _fetch_bbox_composite(
+            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        )
+
     preview_img.thumbnail((512, 512), Image.LANCZOS)
     buf = io.BytesIO()
     preview_img.save(buf, format="JPEG", quality=85)
@@ -377,9 +475,11 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 "search_zoom": search_zoom,
                 "available_zooms": APP_STATE["available_zooms"],
                 "n_tiles": n_tiles,
-                "composite_w": region_img.width,
-                "composite_h": region_img.height,
+                "mode": mode,
+                "composite_w": preview_img.width,
+                "composite_h": preview_img.height,
                 "preview_b64": preview_b64,
+                "aspect_corrected": aspect_correct_query,
             },
             "results": results,
         }
@@ -397,7 +497,8 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
     # Fetch source pixels at the indexed zoom so the query vector lives in
     # the same feature space as the searched tiles.
     x, y = latlon_to_tile(q.lat, q.lon, index_zoom)
-    vec = _fetch_and_embed(index_zoom, x, y)
+    aspect_correct = _index_is_aspect_corrected(index_zoom)
+    vec = _fetch_and_embed(index_zoom, x, y, aspect_correct=aspect_correct)
     results = _search(vec, q.top_k, zoom=index_zoom)
     return JSONResponse(
         {
@@ -521,6 +622,15 @@ HTML = r"""<!doctype html>
       <button id="surprise">🔭 Surprise me (top anomalies)</button>
       <button id="mode-toggle">🔲 Region select: OFF</button>
     </div>
+    <div id="region-mode-panel" style="margin-bottom:10px;display:none">
+      <label class="muted">Region-query mode:
+        <select id="region-query-mode">
+          <option value="composite" selected>composite — one vector from stitched region (match overall signature)</option>
+          <option value="aggregate">aggregate — average constituent tile vectors (characteristic average)</option>
+          <option value="multi">multi — search each constituent, merge (matches ANY piece of region)</option>
+        </select>
+      </label>
+    </div>
     <p class="muted" id="mode-hint">Click a spot on Mars = query that tile. Toggle region select, then drag a rectangle to query an arbitrary region (smaller or larger than a tile).</p>
     <div id="query"></div>
     <h2>Results</h2>
@@ -553,10 +663,11 @@ let regionMode = false;
 let dragging = null;
 
 const modeBtn = document.getElementById("mode-toggle");
+const regionModePanel = document.getElementById("region-mode-panel");
 modeBtn.onclick = () => {
   regionMode = !regionMode;
   modeBtn.innerText = regionMode ? "🔲 Region select: ON" : "🔲 Region select: OFF";
-  // Disable map drag while in region mode so mousedown starts a bbox draw.
+  regionModePanel.style.display = regionMode ? "block" : "none";
   if (regionMode) map.dragging.disable();
   else map.dragging.enable();
 };
@@ -611,10 +722,11 @@ map.on("mouseup", async (e) => {
   if (lat_max - lat_min < 1e-4 || lon_max - lon_min < 1e-4) return;  // ignore tiny drags
   document.getElementById("query").innerHTML =
     `<p>Querying region (${lat_min.toFixed(2)},${lon_min.toFixed(2)})–(${lat_max.toFixed(2)},${lon_max.toFixed(2)})...</p>`;
+  const queryMode = document.getElementById("region-query-mode").value;
   const resp = await fetch("/api/query_bbox", {
     method: "POST",
     headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({lat_min, lat_max, lon_min, lon_max, top_k: 20}),
+    body: JSON.stringify({lat_min, lat_max, lon_min, lon_max, top_k: 20, mode: queryMode}),
   });
   const data = await resp.json();
   renderBboxQuery(data.query);
@@ -623,10 +735,10 @@ map.on("mouseup", async (e) => {
 
 function renderBboxQuery(q) {
   document.getElementById("query").innerHTML = `
-    <h3>Query region</h3>
+    <h3>Query region (${q.mode})</h3>
     <img src="data:image/jpeg;base64,${q.preview_b64}" style="width:100%;max-width:400px;border:1px solid #333"/>
-    <p class="muted">${q.composite_w}×${q.composite_h} px composited from ${q.n_tiles} tile(s) fetched at z=${q.fetch_z}</p>
-    <p class="muted">Searched at z=${q.search_zoom} (available: ${q.available_zooms.join(", ")})</p>
+    <p class="muted">${q.composite_w}×${q.composite_h} px previewed from ${q.n_tiles} tile(s) fetched at z=${q.fetch_z}</p>
+    <p class="muted">Searched at z=${q.search_zoom} (available: ${q.available_zooms.join(", ")}) • aspect-corrected: ${q.aspect_corrected}</p>
     <p class="muted">bbox: lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}</p>
   `;
 }
