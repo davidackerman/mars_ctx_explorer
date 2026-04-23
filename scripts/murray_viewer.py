@@ -313,12 +313,41 @@ def _embed_pil(img: Image.Image) -> np.ndarray:
     return vec
 
 
-def _search(vec: np.ndarray, top_k: int, zoom: Optional[int] = None) -> list[dict]:
+def _nms_spatial(results: list[dict], top_k: int, min_separation_tiles: int) -> list[dict]:
+    """Greedy non-maximum suppression by tile-index distance. Results are
+    expected to be sorted by similarity desc. `min_separation_tiles` is the
+    minimum Chebyshev distance (in tile units at each result's zoom) between
+    two kept hits — raising it spreads results geographically."""
+    kept: list[dict] = []
+    for r in results:
+        too_close = False
+        for k in kept:
+            if k["z"] != r["z"]:
+                continue
+            if max(abs(k["x"] - r["x"]), abs(k["y"] - r["y"])) < min_separation_tiles:
+                too_close = True
+                break
+        if not too_close:
+            kept.append(r)
+            if len(kept) >= top_k:
+                break
+    return kept
+
+
+def _search(
+    vec: np.ndarray,
+    top_k: int,
+    zoom: Optional[int] = None,
+    spatial_diversity: bool = False,
+    diversity_tiles: int = 4,
+) -> list[dict]:
     state = APP_STATE["indices"][zoom] if zoom in APP_STATE["indices"] else None
     if state is None:
         z = APP_STATE["default_zoom"]
         state = APP_STATE["indices"][z]
-    distances, indices = state["index"].search(vec, top_k)
+    # Oversample when diversity is on so NMS has room to suppress clusters.
+    fetch_k = top_k * 8 if spatial_diversity else top_k
+    distances, indices = state["index"].search(vec, fetch_k)
     md: pd.DataFrame = state["metadata"]
     results = []
     for dist, idx in zip(distances[0], indices[0]):
@@ -338,6 +367,10 @@ def _search(vec: np.ndarray, top_k: int, zoom: Optional[int] = None) -> list[dic
                 "tile_bounds": list(tile_bounds_deg(z_i, x_i, y_i)),
             }
         )
+    if spatial_diversity:
+        results = _nms_spatial(results, top_k, diversity_tiles)
+    else:
+        results = results[:top_k]
     return results
 
 
@@ -349,6 +382,8 @@ class LatLonQuery(BaseModel):
     lon: float
     zoom: Optional[int] = None
     top_k: int = 20
+    spatial_diversity: bool = False
+    diversity_tiles: int = 4
 
 
 class BboxQuery(BaseModel):
@@ -360,6 +395,8 @@ class BboxQuery(BaseModel):
     top_k: int = 20
     mode: str = "composite"  # "composite" | "aggregate" | "multi"
     localize: bool = False  # find best sub-region within each result tile
+    spatial_diversity: bool = False
+    diversity_tiles: int = 4
 
 
 @app.post("/api/query_bbox")
@@ -421,7 +458,11 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                     (new_w, region_img.height), Image.LANCZOS
                 )
         vec = _embed_pil(region_img)
-        results = _search(vec, q.top_k, zoom=search_zoom)
+        results = _search(
+            vec, q.top_k, zoom=search_zoom,
+            spatial_diversity=q.spatial_diversity,
+            diversity_tiles=q.diversity_tiles,
+        )
         preview_img = region_img.copy()
     else:
         # Fetch each intersecting tile at the SEARCH zoom (not the fetch
@@ -459,7 +500,11 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             # search. "Characteristic average of what's in this region."
             mean_vec = vecs_np.mean(axis=0, keepdims=True)
             faiss.normalize_L2(mean_vec)
-            results = _search(mean_vec, q.top_k, zoom=search_zoom)
+            results = _search(
+                mean_vec, q.top_k, zoom=search_zoom,
+                spatial_diversity=q.spatial_diversity,
+                diversity_tiles=q.diversity_tiles,
+            )
         elif mode == "multi":
             # Run one search per constituent, merge by best similarity per
             # result row_id. "Anywhere that looks like ANY piece of this
@@ -467,15 +512,19 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             all_hits: dict[tuple, dict] = {}
             for v in vecs_np:
                 hits = _search(
-                    v.reshape(1, -1), q.top_k, zoom=search_zoom
+                    v.reshape(1, -1), q.top_k, zoom=search_zoom,
                 )
                 for h in hits:
                     key = (h["z"], h["x"], h["y"])
                     if key not in all_hits or h["similarity"] > all_hits[key]["similarity"]:
                         all_hits[key] = h
-            results = sorted(
+            merged = sorted(
                 all_hits.values(), key=lambda h: h["similarity"], reverse=True
-            )[: q.top_k]
+            )
+            if q.spatial_diversity:
+                results = _nms_spatial(merged, q.top_k, q.diversity_tiles)
+            else:
+                results = merged[: q.top_k]
         else:
             raise HTTPException(status_code=400, detail=f"Unknown mode: {mode}")
 
@@ -590,7 +639,11 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
     x, y = latlon_to_tile(q.lat, q.lon, index_zoom)
     aspect_correct = _index_is_aspect_corrected(index_zoom)
     vec = _fetch_and_embed(index_zoom, x, y, aspect_correct=aspect_correct)
-    results = _search(vec, q.top_k, zoom=index_zoom)
+    results = _search(
+        vec, q.top_k, zoom=index_zoom,
+        spatial_diversity=q.spatial_diversity,
+        diversity_tiles=q.diversity_tiles,
+    )
     return JSONResponse(
         {
             "query": {
@@ -977,16 +1030,28 @@ GLOBE_HTML = r"""<!doctype html>
   <div id="cesiumContainer"></div>
   <div id="side">
     <h2>3D Mars globe</h2>
-    <p class="muted">Left-click = query that tile. Toggle region-select then drag a rectangle to query an arbitrary sub-tile region.</p>
+    <p class="muted"><b>Click</b> = query that tile. <b>Shift+drag</b> = draw a rectangle and query an arbitrary region. <a href="#" id="mode-help-link">[what do the modes mean?]</a></p>
+    <div id="mode-help" style="display:none;background:#1a1a1a;border:1px solid #333;padding:8px;margin-bottom:8px;font-size:.85em;line-height:1.35">
+      <p><b>composite</b> — all tiles inside your rectangle are stitched into one image; DINO gives one query vector. Matches the <i>overall signature</i> of the scene. Best for "find other places that look like this whole patch."</p>
+      <p><b>aggregate</b> — each constituent tile's own CLS vector is averaged; one search. Matches the <i>average look</i> of the constituents. Best when texture matters but arrangement doesn't.</p>
+      <p><b>multi</b> — one search per constituent tile, results merged by best score. Matches if <i>any piece</i> of your region resembles the hit. Most recall, least precision.</p>
+      <p><b>Spatial diversity (NMS)</b> — after ranking, suppress hits that share a neighbourhood (within N tiles of another kept hit) so you don't get 20 results all clustered in the same crater field.</p>
+      <p><b>Localize within each result</b> — for every top-k hit, run patch-level matching to find the best sub-region inside that tile and draw a yellow highlight box. Adds 3-10 s.</p>
+    </div>
     <fieldset style="border:1px solid #333;padding:8px;margin:8px 0">
-      <legend class="muted">Region query</legend>
-      <label style="display:block;margin-bottom:6px"><input type="checkbox" id="mode-toggle"/> <b>Region select</b> (drag on the globe)</label>
-      <label class="muted" style="display:block;margin-bottom:4px">Mode:
+      <legend class="muted">Query options</legend>
+      <label class="muted" style="display:block;margin-bottom:4px">Region mode:
         <select id="region-query-mode" style="width:100%">
-          <option value="composite" selected>composite — stitch region into one vector (overall signature)</option>
-          <option value="aggregate">aggregate — mean of constituent tile vectors (avg look)</option>
-          <option value="multi">multi — search each constituent, merge (match ANY piece)</option>
+          <option value="composite" selected>composite — one vector from stitched region</option>
+          <option value="aggregate">aggregate — average of tile vectors</option>
+          <option value="multi">multi — search each tile, merge</option>
         </select>
+      </label>
+      <label class="muted" style="display:block;margin-top:4px">
+        <input type="checkbox" id="spatial-diversity" checked/>
+        Spatial diversity (spread hits apart;
+        <input type="number" id="diversity-tiles" value="4" min="1" max="32" style="width:3em"/>
+        tile buffer)
       </label>
       <label class="muted" style="display:block">
         <input type="checkbox" id="region-localize"/>
@@ -1144,11 +1209,17 @@ async function queryLatLon(lat, lon) {
     point: { pixelSize: 12, color: Cesium.Color.CYAN.withAlpha(0.7), outlineColor: Cesium.Color.WHITE, outlineWidth: 1 },
   });
   const leafletZoomApprox = Math.max(...AVAILABLE_ZOOMS);
+  const diversity = document.getElementById("spatial-diversity")?.checked ?? false;
+  const diversityTiles = parseInt(document.getElementById("diversity-tiles")?.value) || 4;
   try {
     const resp = await fetch("/api/query_latlon", {
       method: "POST",
       headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({lat, lon, zoom: leafletZoomApprox, top_k: 20}),
+      body: JSON.stringify({
+        lat, lon, zoom: leafletZoomApprox, top_k: 20,
+        spatial_diversity: diversity,
+        diversity_tiles: diversityTiles,
+      }),
     });
     if (!resp.ok) {
       const err = await resp.text();
@@ -1260,12 +1331,15 @@ function renderResults(results, scoreCol) {
   viewer.scene.requestRender();
 }
 
-// ---- Region-select (drag a rectangle on the globe) --------------------- //
-let regionMode = false;
+// ---- Region-select (Shift+drag a rectangle on the globe) --------------- //
 let dragState = null;  // {startLat, startLon, endLat, endLon}
 let queryRectEntity = null;
-const modeBtn = document.getElementById("mode-toggle");
 const cesiumContainer = document.getElementById("cesiumContainer");
+document.getElementById("mode-help-link").onclick = (e) => {
+  e.preventDefault();
+  const h = document.getElementById("mode-help");
+  h.style.display = h.style.display === "none" ? "block" : "none";
+};
 
 function pickLatLon(windowPos) {
   const cartesian = viewer.camera.pickEllipsoid(windowPos, marsEllipsoid);
@@ -1291,33 +1365,35 @@ function setQueryRect(latMin, lonMin, latMax, lonMax) {
   viewer.scene.requestRender();
 }
 
-modeBtn.onchange = () => {
-  regionMode = modeBtn.checked;
-  viewer.scene.screenSpaceCameraController.enableInputs = !regionMode;
-  cesiumContainer.style.cursor = regionMode ? "crosshair" : "default";
-};
-
 const ssh = viewer.screenSpaceEventHandler;
+const SHIFT = Cesium.KeyboardEventModifier.SHIFT;
 
+// Shift+LEFT_DOWN starts a region-select drag. Cesium only fires this
+// when Shift is held, so unmodified drags still rotate the globe.
 ssh.setInputAction((evt) => {
-  if (!regionMode) return;
   const p = pickLatLon(evt.position);
   if (!p) return;
+  // Freeze the camera for the duration of the drag so the rectangle doesn't
+  // fight with a rotate. Re-enabled on LEFT_UP.
+  viewer.scene.screenSpaceCameraController.enableInputs = false;
+  cesiumContainer.style.cursor = "crosshair";
   dragState = { startLat: p.lat, startLon: p.lon, endLat: p.lat, endLon: p.lon };
   setQueryRect(p.lat, p.lon, p.lat, p.lon);
-}, Cesium.ScreenSpaceEventType.LEFT_DOWN);
+}, Cesium.ScreenSpaceEventType.LEFT_DOWN, SHIFT);
 
-// Click-to-query (tile-level) fires on LEFT_CLICK, not LEFT_DOWN, so camera
-// drags don't accidentally launch a query on mouse-press.
+// Click-to-query on LEFT_CLICK (fires on release, so plain drags to rotate
+// don't fire queries).
 ssh.setInputAction((evt) => {
-  if (regionMode) return;
+  if (dragState) return;
   const p = pickLatLon(evt.position);
   if (!p) return;
   queryLatLon(p.lat, p.lon);
 }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
 
+// Mouse-move: we track the drag regardless of whether Shift is still held,
+// since the user may release Shift mid-drag.
 ssh.setInputAction((evt) => {
-  if (!regionMode || !dragState) return;
+  if (!dragState) return;
   const p = pickLatLon(evt.endPosition);
   if (!p) return;
   dragState.endLat = p.lat;
@@ -1330,10 +1406,12 @@ ssh.setInputAction((evt) => {
   );
 }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
 
-ssh.setInputAction(async (evt) => {
-  if (!regionMode || !dragState) return;
+async function finishRegionDrag() {
+  if (!dragState) return;
   const d = dragState;
   dragState = null;
+  viewer.scene.screenSpaceCameraController.enableInputs = true;
+  cesiumContainer.style.cursor = "default";
   const latMin = Math.min(d.startLat, d.endLat);
   const latMax = Math.max(d.startLat, d.endLat);
   const lonMin = Math.min(d.startLon, d.endLon);
@@ -1343,19 +1421,35 @@ ssh.setInputAction(async (evt) => {
     `<p>Querying region (${latMin.toFixed(2)},${lonMin.toFixed(2)})–(${latMax.toFixed(2)},${lonMax.toFixed(2)})…</p>`;
   const queryMode = document.getElementById("region-query-mode").value;
   const localize = document.getElementById("region-localize").checked;
-  const resp = await fetch("/api/query_bbox", {
-    method: "POST",
-    headers: {"Content-Type":"application/json"},
-    body: JSON.stringify({
-      lat_min: latMin, lat_max: latMax,
-      lon_min: lonMin, lon_max: lonMax,
-      top_k: 20, mode: queryMode, localize: localize,
-    }),
-  });
-  const data = await resp.json();
-  renderQuery(data.query);
-  renderResults(data.results || [], "similarity");
-}, Cesium.ScreenSpaceEventType.LEFT_UP);
+  const diversity = document.getElementById("spatial-diversity").checked;
+  const diversityTiles = parseInt(document.getElementById("diversity-tiles").value) || 4;
+  try {
+    const resp = await fetch("/api/query_bbox", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        lat_min: latMin, lat_max: latMax,
+        lon_min: lonMin, lon_max: lonMax,
+        top_k: 20, mode: queryMode, localize: localize,
+        spatial_diversity: diversity,
+        diversity_tiles: diversityTiles,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      document.getElementById("query").innerHTML =
+        `<p style="color:#f88">Region query failed (HTTP ${resp.status}): ${err.slice(0,200)}</p>`;
+      return;
+    }
+    const data = await resp.json();
+    renderQuery(data.query);
+    renderResults(data.results || [], "similarity");
+  } catch (e) {
+    document.getElementById("query").innerHTML = `<p style="color:#f88">Network error: ${e.message}</p>`;
+  }
+}
+ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP);
+ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP, SHIFT);
 </script>
 </body></html>
 """
