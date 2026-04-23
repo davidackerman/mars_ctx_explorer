@@ -950,10 +950,6 @@ const imagery = new Cesium.UrlTemplateImageryProvider({
   credit: "NASA/JPL/MSSS/The Murray Lab (Dickson et al. 2024)",
 });
 
-// Cesium's Viewer runs a 3s flyTo-home animation on startup. We want the
-// camera parked on Mars immediately, so override the "home" rectangle to
-// the full globe and setView synchronously; the flight planner then sees
-// us already there and no-ops.
 Cesium.Camera.DEFAULT_VIEW_RECTANGLE = Cesium.Rectangle.fromDegrees(-180, -90, 180, 90);
 Cesium.Camera.DEFAULT_VIEW_FACTOR = 0;
 
@@ -968,28 +964,33 @@ const viewer = new Cesium.Viewer("cesiumContainer", {
   homeButton: false,
   sceneModePicker: false,
   navigationHelpButton: false,
+  fullscreenButton: false,
   baseLayer: new Cesium.ImageryLayer(imagery),
   terrainProvider: new Cesium.EllipsoidTerrainProvider({ ellipsoid: marsEllipsoid }),
   skyBox: false,
   skyAtmosphere: false,
+  useDefaultRenderLoop: true,
 });
 viewer.scene.globe.showGroundAtmosphere = false;
 viewer.scene.backgroundColor = Cesium.Color.BLACK;
 viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#2a1a12");
+// Render only when the scene actually changes (not every frame). This alone
+// stops the "camera keeps approaching" visual — without it, Cesium renders
+// at 60 Hz and any latent tween in the camera controller keeps firing.
+viewer.scene.requestRenderMode = true;
 viewer.clock.shouldAnimate = false;
-// Park the camera looking straight down at 0,0 from 9000 km altitude.
-function parkCamera() {
-  viewer.camera.cancelFlight();
-  viewer.camera.setView({
-    destination: Cesium.Cartesian3.fromDegrees(0, 0, 9_000_000, marsEllipsoid),
-    orientation: { heading: 0, pitch: -Math.PI / 2, roll: 0 },
-  });
-}
-parkCamera();
-// Re-park on the next two frames in case Cesium schedules a home-flight
-// inside its own postUpdate/postRender after construction.
-requestAnimationFrame(parkCamera);
-requestAnimationFrame(() => requestAnimationFrame(parkCamera));
+
+// Place the camera at a fixed, sensible Mars-orbit view — explicit Cartesian
+// so we don't depend on Cartesian3.fromDegrees or any ellipsoid default.
+const MARS_VIEW_ALT = 12_000_000;  // ~8600 km above surface, whole disk in frame
+viewer.camera.setView({
+  destination: new Cesium.Cartesian3(MARS_VIEW_ALT, 0, 0),
+  orientation: {
+    direction: new Cesium.Cartesian3(-1, 0, 0),
+    up: new Cesium.Cartesian3(0, 0, 1),
+  },
+});
+viewer.scene.requestRender();
 
 let resultEntities = [];
 let queryEntity = null;
