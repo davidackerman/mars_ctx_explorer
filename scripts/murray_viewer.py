@@ -977,6 +977,7 @@ const viewer = new Cesium.Viewer("cesiumContainer", {
   skyBox: false,
   skyAtmosphere: false,
   useDefaultRenderLoop: true,
+  globe: new Cesium.Globe(marsEllipsoid),
 });
 viewer.scene.globe.showGroundAtmosphere = false;
 viewer.scene.backgroundColor = Cesium.Color.BLACK;
@@ -1011,11 +1012,15 @@ const FIXED_UP = new Cesium.Cartesian3(0, 0, 1);
 const FIXED_RIGHT = new Cesium.Cartesian3();
 Cesium.Cartesian3.cross(FIXED_DIR, FIXED_UP, FIXED_RIGHT);
 Cesium.Cartesian3.normalize(FIXED_RIGHT, FIXED_RIGHT);
+const FIXED_FOV = Cesium.Math.toRadians(60);
 function clampCamera() {
   Cesium.Cartesian3.clone(FIXED_POS, viewer.camera.position);
   Cesium.Cartesian3.clone(FIXED_DIR, viewer.camera.direction);
   Cesium.Cartesian3.clone(FIXED_UP, viewer.camera.up);
   Cesium.Cartesian3.clone(FIXED_RIGHT, viewer.camera.right);
+  if (viewer.camera.frustum && "fov" in viewer.camera.frustum) {
+    viewer.camera.frustum.fov = FIXED_FOV;
+  }
 }
 viewer.camera.setView({
   destination: FIXED_POS,
@@ -1039,7 +1044,14 @@ document.getElementById("cesiumContainer").appendChild(hud);
 viewer.scene.postRender.addEventListener(() => {
   const p = viewer.camera.position;
   const r = Math.sqrt(p.x*p.x + p.y*p.y + p.z*p.z);
-  hud.textContent = `cam ${(p.x/1e6).toFixed(3)}, ${(p.y/1e6).toFixed(3)}, ${(p.z/1e6).toFixed(3)} Mm · r=${(r/1e6).toFixed(3)} Mm · alt=${((r - MARS_EQ)/1e6).toFixed(3)} Mm`;
+  const fov = viewer.camera.frustum.fov !== undefined
+    ? Cesium.Math.toDegrees(viewer.camera.frustum.fov).toFixed(1)
+    : "?";
+  const cvs = viewer.canvas;
+  const ge = viewer.scene.globe.ellipsoid.radii;
+  hud.innerHTML =
+    `cam ${(p.x/1e6).toFixed(2)}, ${(p.y/1e6).toFixed(2)}, ${(p.z/1e6).toFixed(2)} Mm · r=${(r/1e6).toFixed(2)} Mm<br>` +
+    `fov=${fov}° · canvas=${cvs.width}x${cvs.height} · globe r=${(ge.x/1e6).toFixed(2)}/${(ge.y/1e6).toFixed(2)}/${(ge.z/1e6).toFixed(2)} Mm`;
 });
 viewer.scene.requestRender();
 
