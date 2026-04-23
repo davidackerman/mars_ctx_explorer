@@ -924,15 +924,16 @@ GLOBE_HTML = r"""<!doctype html>
 // Mars ellipsoid (MOLA IAU2000): equatorial 3396190 m, polar 3376200 m.
 const MARS_EQ = 3396190.0;
 const MARS_POLAR = 3376200.0;
-Cesium.Ellipsoid.WGS84 = Cesium.Ellipsoid.fromCartesian3(
-  new Cesium.Cartesian3(MARS_EQ, MARS_EQ, MARS_POLAR)
-);
-// Silence Cesium Ion — we don't use their default imagery.
+const marsEllipsoid = new Cesium.Ellipsoid(MARS_EQ, MARS_EQ, MARS_POLAR);
+// Override Cesium's default ellipsoid BEFORE constructing the viewer, so
+// Cartesian3.fromDegrees, the globe tessellator, and the camera controller
+// all treat lat/lon on Mars instead of Earth. Cesium.Ellipsoid.WGS84 is a
+// frozen constant; Cesium.Ellipsoid.default (1.117+) is the writable knob.
+Cesium.Ellipsoid.default = marsEllipsoid;
 Cesium.Ion.defaultAccessToken = "";
 const TILE_URL = "https://astro.arcgis.com/arcgis/rest/services/OnMars/CTX1/MapServer/tile/{z}/{y}/{x}";
 const AVAILABLE_ZOOMS = %(AVAILABLE_ZOOMS)s;
 
-const marsEllipsoid = new Cesium.Ellipsoid(MARS_EQ, MARS_EQ, MARS_POLAR);
 const tilingScheme = new Cesium.GeographicTilingScheme({
   ellipsoid: marsEllipsoid,
   rectangle: Cesium.Rectangle.fromDegrees(-180, -90, 180, 90),
@@ -960,15 +961,18 @@ const viewer = new Cesium.Viewer("cesiumContainer", {
   homeButton: false,
   sceneModePicker: false,
   navigationHelpButton: false,
-  imageryProvider: imagery,
+  baseLayer: Cesium.ImageryLayer.fromProviderAsync(Promise.resolve(imagery)),
   terrainProvider: new Cesium.EllipsoidTerrainProvider({ ellipsoid: marsEllipsoid }),
   skyBox: false,
   skyAtmosphere: false,
 });
 viewer.scene.globe.showGroundAtmosphere = false;
 viewer.scene.backgroundColor = Cesium.Color.BLACK;
-viewer.scene.camera.setView({
-  destination: Cesium.Cartesian3.fromDegrees(0, 0, 7_000_000),
+viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#2a1a12");
+// Cancel Cesium's default flyHome-on-load so our setView sticks.
+viewer.camera.cancelFlight();
+viewer.camera.setView({
+  destination: Cesium.Cartesian3.fromDegrees(0, 0, 9_000_000, marsEllipsoid),
 });
 
 let resultEntities = [];
@@ -984,7 +988,7 @@ async function queryLatLon(lat, lon) {
     `<p>Querying lat ${lat.toFixed(2)}, lon ${lon.toFixed(2)}…</p>`;
   if (queryEntity) viewer.entities.remove(queryEntity);
   queryEntity = viewer.entities.add({
-    position: Cesium.Cartesian3.fromDegrees(lon, lat),
+    position: Cesium.Cartesian3.fromDegrees(lon, lat, 0, marsEllipsoid),
     point: { pixelSize: 12, color: Cesium.Color.CYAN.withAlpha(0.7), outlineColor: Cesium.Color.WHITE, outlineWidth: 1 },
   });
   const leafletZoomApprox = Math.max(...AVAILABLE_ZOOMS);
@@ -1023,7 +1027,7 @@ function renderResults(results, scoreCol) {
       </div>`;
     row.onclick = () => {
       viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000),
+        destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000, marsEllipsoid),
       });
     };
     el.appendChild(row);
