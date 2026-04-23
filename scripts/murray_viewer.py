@@ -32,6 +32,7 @@ import requests
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi import Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel
@@ -67,6 +68,16 @@ def tile_center_deg(z: int, x: int, y: int) -> tuple[float, float]:
     lon = -180.0 + (x + 0.5) * size
     lat = 90.0 - (y + 0.5) * size
     return lat, lon
+
+
+def tile_bounds_deg(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    """Return (lat_min, lat_max, lon_min, lon_max) in degrees."""
+    size = TILE_PX * pixel_size_deg(z)
+    lon_min = -180.0 + x * size
+    lon_max = lon_min + size
+    lat_max = 90.0 - y * size
+    lat_min = lat_max - size
+    return lat_min, lat_max, lon_min, lon_max
 
 
 APP_STATE: dict = {}
@@ -323,7 +334,8 @@ def _search(vec: np.ndarray, top_k: int, zoom: Optional[int] = None) -> list[dic
                 "lat": float(row.lat),
                 "lon": float(row.lon),
                 "similarity": float(dist),
-                "tile_url": TILE_URL.format(z=z_i, x=x_i, y=y_i),
+                "tile_url": f"/api/tile_img?z={z_i}&x={x_i}&y={y_i}",
+                "tile_bounds": list(tile_bounds_deg(z_i, x_i, y_i)),
             }
         )
     return results
@@ -583,7 +595,8 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
         {
             "query": {
                 "lat": q.lat, "lon": q.lon, "z": index_zoom, "x": x, "y": y,
-                "tile_url": TILE_URL.format(z=index_zoom, x=x, y=y),
+                "tile_url": f"/api/tile_img?z={index_zoom}&x={x}&y={y}",
+                "tile_bounds": list(tile_bounds_deg(index_zoom, x, y)),
                 "index_zoom_used": index_zoom,
                 "available_zooms": APP_STATE["available_zooms"],
             },
@@ -660,10 +673,35 @@ def api_anomalies(k: int = 20) -> JSONResponse:
                 "z": z_i, "x": x_i, "y": y_i,
                 "lat": float(row.lat), "lon": float(row.lon),
                 "anomaly_score": float(row.anomaly_score),
-                "tile_url": TILE_URL.format(z=z_i, x=x_i, y=y_i),
+                "tile_url": f"/api/tile_img?z={z_i}&x={x_i}&y={y_i}",
+                "tile_bounds": list(tile_bounds_deg(z_i, x_i, y_i)),
             }
         )
     return JSONResponse({"anomalies": payload})
+
+
+@app.get("/api/tile_img")
+def api_tile_img(z: int, x: int, y: int) -> Response:
+    """Proxy Murray Lab tiles through the server so clients inherit our
+    retry/backoff policy and don't hit ArcGIS directly while the patch
+    indexer is saturating the upstream rate limit."""
+    url = TILE_URL.format(z=z, x=x, y=y)
+    r = None
+    for attempt in range(4):
+        try:
+            r = APP_STATE["session"].get(url, timeout=15)
+            if r.status_code == 200:
+                break
+        except requests.RequestException:
+            r = None
+        time.sleep(0.3 * (attempt + 1))
+    if r is None or r.status_code != 200:
+        raise HTTPException(status_code=502, detail="Upstream tile fetch failed after retries")
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -939,26 +977,25 @@ GLOBE_HTML = r"""<!doctype html>
   <div id="cesiumContainer"></div>
   <div id="side">
     <h2>3D Mars globe</h2>
-    <p class="muted">Left-click = tile-level similar. Toggle region-select, then drag a rectangle on the globe for arbitrary sub-tile queries.</p>
-    <div style="margin-bottom:10px">
-      <button id="mode-toggle">🔲 Region select: OFF</button>
-    </div>
-    <div id="region-mode-panel" style="margin-bottom:10px;display:none">
-      <label class="muted">Region-query mode:
-        <select id="region-query-mode">
-          <option value="composite" selected>composite — one vector from stitched region</option>
-          <option value="aggregate">aggregate — average of constituent tile vectors</option>
-          <option value="multi">multi — search each constituent, merge</option>
+    <p class="muted">Left-click = query that tile. Toggle region-select then drag a rectangle to query an arbitrary sub-tile region.</p>
+    <fieldset style="border:1px solid #333;padding:8px;margin:8px 0">
+      <legend class="muted">Region query</legend>
+      <label style="display:block;margin-bottom:6px"><input type="checkbox" id="mode-toggle"/> <b>Region select</b> (drag on the globe)</label>
+      <label class="muted" style="display:block;margin-bottom:4px">Mode:
+        <select id="region-query-mode" style="width:100%">
+          <option value="composite" selected>composite — stitch region into one vector (overall signature)</option>
+          <option value="aggregate">aggregate — mean of constituent tile vectors (avg look)</option>
+          <option value="multi">multi — search each constituent, merge (match ANY piece)</option>
         </select>
       </label>
-      <label class="muted" style="display:block;margin-top:4px">
+      <label class="muted" style="display:block">
         <input type="checkbox" id="region-localize"/>
-        Localize WITHIN each result tile (+3-10 s)
+        Localize within each result tile (+3-10 s)
       </label>
-    </div>
+    </fieldset>
     <p class="muted"><a href="/">← back to 2D viewer</a></p>
     <div id="query"></div>
-    <h2>Results</h2>
+    <h2>Results <span class="muted" style="font-weight:normal">(hover = highlight on globe · click = fly + preview)</span></h2>
     <div id="results"><p class="muted">Click anywhere on Mars.</p></div>
   </div>
 </div>
@@ -1164,25 +1201,63 @@ function renderResults(results, scoreCol) {
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
         <div>lat ${r.lat.toFixed(2)} • lon ${r.lon.toFixed(2)}</div>
       </div>`;
-    row.onclick = () => {
-      viewer.camera.flyTo({
-        destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000, marsEllipsoid),
-      });
-    };
-    el.appendChild(row);
-    const ent = viewer.entities.add({
-      position: Cesium.Cartesian3.fromDegrees(r.lon, r.lat),
+
+    // Draw the matching tile as a translucent rectangle on the globe.
+    // Colour by rank so the top hit pops.
+    const t = r.tile_bounds;  // [latMin, latMax, lonMin, lonMax]
+    const isAnom = scoreCol === "anomaly_score";
+    const baseColor = isAnom
+      ? Cesium.Color.GOLD
+      : Cesium.Color.fromCssColorString("#ff6b9a");
+    const rectEnt = t ? viewer.entities.add({
+      rectangle: {
+        coordinates: Cesium.Rectangle.fromDegrees(t[2], t[0], t[3], t[1]),
+        material: baseColor.withAlpha(0.18),
+        outline: true,
+        outlineColor: baseColor.withAlpha(0.9),
+        height: 0,
+      },
+    }) : null;
+    const pinEnt = viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 0, marsEllipsoid),
       point: {
-        pixelSize: 10,
-        color: scoreCol === "anomaly_score"
-          ? Cesium.Color.GOLD.withAlpha(0.8)
-          : Cesium.Color.fromCssColorString("#ff6b9a").withAlpha(0.8),
+        pixelSize: 8,
+        color: baseColor.withAlpha(0.9),
         outlineColor: Cesium.Color.BLACK,
         outlineWidth: 1,
       },
     });
-    resultEntities.push(ent);
+    if (rectEnt) resultEntities.push(rectEnt);
+    resultEntities.push(pinEnt);
+
+    // Hover: brighten this result's rectangle.
+    row.onmouseenter = () => {
+      if (rectEnt) {
+        rectEnt.rectangle.material = baseColor.withAlpha(0.45);
+        rectEnt.rectangle.outlineColor = Cesium.Color.WHITE;
+      }
+      viewer.scene.requestRender();
+    };
+    row.onmouseleave = () => {
+      if (rectEnt) {
+        rectEnt.rectangle.material = baseColor.withAlpha(0.18);
+        rectEnt.rectangle.outlineColor = baseColor.withAlpha(0.9);
+      }
+      viewer.scene.requestRender();
+    };
+    // Click: fly to it AND render the tile image in the query pane.
+    row.onclick = () => {
+      viewer.camera.flyTo({
+        destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000, marsEllipsoid),
+      });
+      document.getElementById("query").innerHTML = `
+        <h3>Result #${idx + 1} preview</h3>
+        <img src="${r.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>
+        <p class="muted">z=${r.z} • tile (${r.x},${r.y}) • lat ${r.lat.toFixed(2)} lon ${r.lon.toFixed(2)} • ${scoreCol}: ${score?.toFixed(3)}</p>`;
+    };
+    el.appendChild(row);
   });
+  viewer.scene.requestRender();
 }
 
 // ---- Region-select (drag a rectangle on the globe) --------------------- //
@@ -1190,7 +1265,6 @@ let regionMode = false;
 let dragState = null;  // {startLat, startLon, endLat, endLon}
 let queryRectEntity = null;
 const modeBtn = document.getElementById("mode-toggle");
-const regionModePanel = document.getElementById("region-mode-panel");
 const cesiumContainer = document.getElementById("cesiumContainer");
 
 function pickLatLon(windowPos) {
@@ -1217,11 +1291,8 @@ function setQueryRect(latMin, lonMin, latMax, lonMax) {
   viewer.scene.requestRender();
 }
 
-modeBtn.onclick = () => {
-  regionMode = !regionMode;
-  modeBtn.innerText = regionMode ? "🔲 Region select: ON" : "🔲 Region select: OFF";
-  regionModePanel.style.display = regionMode ? "block" : "none";
-  // Disable globe pan/rotate while drawing; re-enable on toggle off.
+modeBtn.onchange = () => {
+  regionMode = modeBtn.checked;
   viewer.scene.screenSpaceCameraController.enableInputs = !regionMode;
   cesiumContainer.style.cursor = regionMode ? "crosshair" : "default";
 };
