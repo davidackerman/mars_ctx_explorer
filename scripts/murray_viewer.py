@@ -901,11 +901,18 @@ GLOBE_HTML = r"""<!doctype html>
 <link href="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Widgets/widgets.css" rel="stylesheet"/>
 <script src="https://cesium.com/downloads/cesiumjs/releases/1.119/Build/Cesium/Cesium.js"></script>
 <style>
-  html, body, #layout { height: 100%; margin: 0; padding: 0; }
+  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; }
   body { font-family: system-ui, sans-serif; background: #000; color: #eee; }
-  #layout { display: grid; grid-template-columns: 2fr 1fr; }
-  #cesiumContainer { width: 100%; height: 100%; }
-  #side { overflow-y: auto; padding: 12px; background: #111; border-left: 1px solid #333; }
+  #layout {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    grid-template-rows: 100vh;
+    height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+  }
+  #cesiumContainer { width: 100%; height: 100vh; min-height: 0; overflow: hidden; position: relative; }
+  #side { overflow-y: auto; min-height: 0; padding: 12px; background: #111; border-left: 1px solid #333; }
   h2 { margin: 6px 0; font-size: 1.05em; }
   .muted { color: #888; font-size: .85em; }
   .result { display: flex; gap: 8px; padding: 6px 4px; border-bottom: 1px solid #222; cursor: pointer; }
