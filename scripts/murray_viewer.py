@@ -1382,9 +1382,15 @@ ssh.setInputAction((evt) => {
 }, Cesium.ScreenSpaceEventType.LEFT_DOWN, SHIFT);
 
 // Click-to-query on LEFT_CLICK (fires on release, so plain drags to rotate
-// don't fire queries).
+// don't fire queries). If a region is staged, the click first clears the
+// stage; a second click runs the tile-level query.
 ssh.setInputAction((evt) => {
   if (dragState) return;
+  if (stagedBbox) {
+    clearStagedRegion();
+    document.getElementById("query").innerHTML = "";
+    return;
+  }
   const p = pickLatLon(evt.position);
   if (!p) return;
   queryLatLon(p.lat, p.lon);
@@ -1406,17 +1412,24 @@ ssh.setInputAction((evt) => {
   );
 }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
 
-async function finishRegionDrag() {
-  if (!dragState) return;
-  const d = dragState;
-  dragState = null;
-  viewer.scene.screenSpaceCameraController.enableInputs = true;
-  cesiumContainer.style.cursor = "default";
-  const latMin = Math.min(d.startLat, d.endLat);
-  const latMax = Math.max(d.startLat, d.endLat);
-  const lonMin = Math.min(d.startLon, d.endLon);
-  const lonMax = Math.max(d.startLon, d.endLon);
-  if (latMax - latMin < 1e-4 || lonMax - lonMin < 1e-4) return;
+// Staged bbox: set by finishRegionDrag, consumed by runStagedRegion() or
+// cleared when the user clicks elsewhere. We DO NOT fire the query
+// automatically on mouseup so accidental drags or mid-drag adjustments
+// don't waste upstream tile fetches.
+let stagedBbox = null;  // {latMin, latMax, lonMin, lonMax}
+
+function clearStagedRegion() {
+  stagedBbox = null;
+  if (queryRectEntity) {
+    viewer.entities.remove(queryRectEntity);
+    queryRectEntity = null;
+  }
+  viewer.scene.requestRender();
+}
+
+async function runStagedRegion() {
+  if (!stagedBbox) return;
+  const { latMin, latMax, lonMin, lonMax } = stagedBbox;
   document.getElementById("query").innerHTML =
     `<p>Querying region (${latMin.toFixed(2)},${lonMin.toFixed(2)})–(${latMax.toFixed(2)},${lonMax.toFixed(2)})…</p>`;
   const queryMode = document.getElementById("region-query-mode").value;
@@ -1438,15 +1451,51 @@ async function finishRegionDrag() {
     if (!resp.ok) {
       const err = await resp.text();
       document.getElementById("query").innerHTML =
-        `<p style="color:#f88">Region query failed (HTTP ${resp.status}): ${err.slice(0,200)}</p>`;
+        `<p style="color:#f88">Region query failed (HTTP ${resp.status}): ${err.slice(0,200)}</p>
+         <button id="retry-region">🔁 Retry</button> <button id="cancel-region">✕ Clear</button>`;
+      document.getElementById("retry-region").onclick = runStagedRegion;
+      document.getElementById("cancel-region").onclick = clearStagedRegion;
       return;
     }
     const data = await resp.json();
     renderQuery(data.query);
     renderResults(data.results || [], "similarity");
+    stagedBbox = null;  // consumed; keep the rectangle visible as context
   } catch (e) {
-    document.getElementById("query").innerHTML = `<p style="color:#f88">Network error: ${e.message}</p>`;
+    document.getElementById("query").innerHTML =
+      `<p style="color:#f88">Network error: ${e.message}</p>
+       <button id="retry-region">🔁 Retry</button> <button id="cancel-region">✕ Clear</button>`;
+    document.getElementById("retry-region").onclick = runStagedRegion;
+    document.getElementById("cancel-region").onclick = clearStagedRegion;
   }
+}
+
+function finishRegionDrag() {
+  if (!dragState) return;
+  const d = dragState;
+  dragState = null;
+  viewer.scene.screenSpaceCameraController.enableInputs = true;
+  cesiumContainer.style.cursor = "default";
+  const latMin = Math.min(d.startLat, d.endLat);
+  const latMax = Math.max(d.startLat, d.endLat);
+  const lonMin = Math.min(d.startLon, d.endLon);
+  const lonMax = Math.max(d.startLon, d.endLon);
+  if (latMax - latMin < 1e-4 || lonMax - lonMin < 1e-4) {
+    clearStagedRegion();
+    return;
+  }
+  stagedBbox = { latMin, latMax, lonMin, lonMax };
+  document.getElementById("query").innerHTML = `
+    <h3>Region staged</h3>
+    <p class="muted">(${latMin.toFixed(2)},${lonMin.toFixed(2)}) – (${latMax.toFixed(2)},${lonMax.toFixed(2)})<br>
+    Adjust options in the panel, then confirm.</p>
+    <button id="run-region" style="background:#264;font-weight:bold">🔍 Search this region</button>
+    <button id="cancel-region">✕ Clear</button>`;
+  document.getElementById("run-region").onclick = runStagedRegion;
+  document.getElementById("cancel-region").onclick = () => {
+    clearStagedRegion();
+    document.getElementById("query").innerHTML = "";
+  };
 }
 ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP);
 ssh.setInputAction(finishRegionDrag, Cesium.ScreenSpaceEventType.LEFT_UP, SHIFT);
