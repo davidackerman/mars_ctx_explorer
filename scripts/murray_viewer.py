@@ -1067,6 +1067,7 @@ GLOBE_HTML = r"""<!doctype html>
     </fieldset>
     <p class="muted"><a href="/">← back to 2D viewer</a></p>
     <div id="query"></div>
+    <div id="result-preview" style="margin-top:6px"></div>
     <h2>Results <span class="muted" style="font-weight:normal">(hover = highlight on globe · click = fly + preview)</span></h2>
     <div id="results"><p class="muted">Click anywhere on Mars.</p></div>
   </div>
@@ -1251,12 +1252,14 @@ async function queryLatLon(lat, lon) {
 }
 
 function renderQuery(q) {
+  document.getElementById("result-preview").innerHTML = "";  // reset on new search
   if (!q) {
     document.getElementById("query").innerHTML = `<p style="color:#f88">Empty query response.</p>`;
     return;
   }
+  const onErr = `this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'`;
   const preview = q.tile_url
-    ? `<img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>`
+    ? `<img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333" onerror="${onErr}"/>`
     : (q.preview_png_b64 ? `<img src="data:image/png;base64,${q.preview_png_b64}" style="width:100%;max-width:320px;border:1px solid #333"/>` : "");
   const loc = (q.z !== undefined && q.x !== undefined)
     ? `z=${q.z} • tile (${q.x},${q.y})`
@@ -1277,7 +1280,7 @@ function renderResults(results, scoreCol) {
     row.className = "result";
     const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
     row.innerHTML = `
-      <img src="${r.tile_url}" loading="lazy"/>
+      <img src="${r.tile_url}" loading="lazy" onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
       <div class="meta">
         <div><b>#${idx + 1}</b></div>
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
@@ -1327,14 +1330,16 @@ function renderResults(results, scoreCol) {
       }
       viewer.scene.requestRender();
     };
-    // Click: fly to it AND render the tile image in the query pane.
+    // Click: fly to it AND render the tile image in a separate preview
+    // pane, so the original query image stays visible for comparison.
     row.onclick = () => {
       viewer.camera.flyTo({
         destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000, marsEllipsoid),
       });
-      document.getElementById("query").innerHTML = `
+      document.getElementById("result-preview").innerHTML = `
         <h3>Result #${idx + 1} preview</h3>
-        <img src="${r.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"/>
+        <img src="${r.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"
+             onerror="this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'"/>
         <p class="muted">z=${r.z} • tile (${r.x},${r.y}) • lat ${r.lat.toFixed(2)} lon ${r.lon.toFixed(2)} • ${scoreCol}: ${score?.toFixed(3)}</p>`;
     };
     el.appendChild(row);
@@ -1362,17 +1367,32 @@ function pickLatLon(windowPos) {
   };
 }
 
+// Live rectangle: Cesium reads lonMin/latMin/lonMax/latMax from this closure
+// via a CallbackProperty, so we just mutate these numbers during the drag
+// instead of removing and re-adding the entity every mouse-move frame (which
+// made the rectangle look laggy under requestRenderMode).
+const rectBounds = { lonMin: 0, latMin: 0, lonMax: 0, latMax: 0 };
 function setQueryRect(latMin, lonMin, latMax, lonMax) {
-  if (queryRectEntity) viewer.entities.remove(queryRectEntity);
-  queryRectEntity = viewer.entities.add({
-    rectangle: {
-      coordinates: Cesium.Rectangle.fromDegrees(lonMin, latMin, lonMax, latMax),
-      material: Cesium.Color.YELLOW.withAlpha(0.2),
-      outline: true,
-      outlineColor: Cesium.Color.YELLOW,
-      height: 0,
-    },
-  });
+  rectBounds.lonMin = lonMin;
+  rectBounds.latMin = latMin;
+  rectBounds.lonMax = lonMax;
+  rectBounds.latMax = latMax;
+  if (!queryRectEntity) {
+    queryRectEntity = viewer.entities.add({
+      rectangle: {
+        coordinates: new Cesium.CallbackProperty(() =>
+          Cesium.Rectangle.fromDegrees(
+            rectBounds.lonMin, rectBounds.latMin,
+            rectBounds.lonMax, rectBounds.latMax,
+          ),
+        false),
+        material: Cesium.Color.YELLOW.withAlpha(0.2),
+        outline: true,
+        outlineColor: Cesium.Color.YELLOW,
+        height: 0,
+      },
+    });
+  }
   viewer.scene.requestRender();
 }
 
