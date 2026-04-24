@@ -269,20 +269,40 @@ def _apply_aspect_correction(img: Image.Image, lat_center: float) -> Image.Image
 
 TILE_CACHE: dict[tuple[int, int, int], bytes] = {}
 TILE_CACHE_MAX = 4096
+TILE_CACHE_DIR = Path("/mnt/bigdisk/Programming/mars_astrobio/outputs/tile_cache")
+
+
+def _disk_cache_path(z: int, x: int, y: int) -> Path:
+    # Shard by z/x_thousands so no single directory balloons past ~1k files.
+    return TILE_CACHE_DIR / f"z{z}" / f"x{x // 1000:03d}" / f"{x}_{y}.jpg"
 
 
 def _fetch_tile_bytes(z: int, x: int, y: int, max_attempts: int = 6) -> bytes:
-    """Fetch raw tile bytes, cached in-memory, with retries+backoff for the
-    transient 429/500/503 storm we see while the patch indexer is running.
+    """Fetch raw tile bytes with 3-tier caching (RAM → disk → upstream) and
+    retries+backoff for the transient 429/500/503 storm we see while the
+    patch indexer is running.
 
-    max_attempts=6 (default) is the long-retry path for query-side embedding
-    where we really need the tile. Cesium imagery hits use max_attempts=2
-    so one missing tile doesn't stall LOD loading; Cesium will reschedule
-    the failed tile on its own later anyway."""
+    max_attempts=6 (default) is the long-retry path for query-side embedding.
+    Cesium imagery hits use max_attempts=2 so one missing tile doesn't stall
+    LOD loading; Cesium will reschedule on its own."""
     key = (z, x, y)
     cached = TILE_CACHE.get(key)
     if cached is not None:
         return cached
+
+    dpath = _disk_cache_path(z, x, y)
+    if dpath.exists():
+        try:
+            data = dpath.read_bytes()
+            if len(data) > 100:  # guard against truncated writes
+                if len(TILE_CACHE) >= TILE_CACHE_MAX:
+                    for k in list(TILE_CACHE.keys())[: TILE_CACHE_MAX // 10]:
+                        TILE_CACHE.pop(k, None)
+                TILE_CACHE[key] = data
+                return data
+        except OSError:
+            pass
+
     url = TILE_URL.format(z=z, x=x, y=y)
     last_status = "no response"
     for attempt in range(max_attempts):
@@ -293,6 +313,13 @@ def _fetch_tile_bytes(z: int, x: int, y: int, max_attempts: int = 6) -> bytes:
                     for k in list(TILE_CACHE.keys())[: TILE_CACHE_MAX // 10]:
                         TILE_CACHE.pop(k, None)
                 TILE_CACHE[key] = r.content
+                try:
+                    dpath.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dpath.with_suffix(".tmp")
+                    tmp.write_bytes(r.content)
+                    tmp.rename(dpath)
+                except OSError:
+                    pass  # disk cache is opportunistic; RAM cache still works
                 return r.content
             last_status = r.status_code
         except requests.RequestException as e:
@@ -1528,6 +1555,12 @@ async function queryLatLon(lat, lon) {
   const leafletZoomApprox = Math.max(...AVAILABLE_ZOOMS);
   const diversity = document.getElementById("spatial-diversity")?.checked ?? false;
   const diversityTiles = parseInt(document.getElementById("diversity-tiles")?.value) || 4;
+  const showError = (msg) => {
+    document.getElementById("query").innerHTML =
+      `<p style="color:#f88">${msg}</p>
+       <button id="retry-click">🔁 Retry</button>`;
+    document.getElementById("retry-click").onclick = () => queryLatLon(lat, lon);
+  };
   try {
     const resp = await fetch("/api/query_latlon", {
       method: "POST",
@@ -1540,19 +1573,15 @@ async function queryLatLon(lat, lon) {
     });
     if (!resp.ok) {
       const err = await resp.text();
-      document.getElementById("query").innerHTML =
-        `<p style="color:#f88">Query failed (HTTP ${resp.status}): ${err.slice(0,200)}</p>`;
+      showError(`Query failed (HTTP ${resp.status}): ${err.slice(0,200)}`);
       return;
     }
     const data = await resp.json();
-    if (!data.query) {
-      document.getElementById("query").innerHTML = `<p style="color:#f88">Empty response from server.</p>`;
-      return;
-    }
+    if (!data.query) { showError("Empty response from server."); return; }
     renderQuery(data.query);
     renderResults(data.results || [], "similarity");
   } catch (e) {
-    document.getElementById("query").innerHTML = `<p style="color:#f88">Network error: ${e.message}</p>`;
+    showError(`Network error: ${e.message}`);
   }
 }
 
