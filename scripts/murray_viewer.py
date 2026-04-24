@@ -553,6 +553,53 @@ def _search_patches(
     return out
 
 
+def _rerank_cls_candidates(
+    qvec: np.ndarray, candidates: list[dict], zoom: int,
+) -> list[dict]:
+    """Replace FAISS/PQ similarity scores with exact cosines.
+
+    Re-fetches each candidate's tile image through the cached _fetch_tile_bytes
+    path, runs DINO on the whole batch in one forward pass, computes exact
+    cosine against the (already-normalized) query vector, and re-sorts. Since
+    pq_bytes=64 compresses 1024-D to 64 bytes and bakes ~0.5 floor into all
+    cosines, this is the only way to surface realistic similarity numbers."""
+    import faiss
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not candidates:
+        return candidates
+    aspect_correct = _index_is_aspect_corrected(zoom)
+    transform = APP_STATE["transform"]
+    extractor = APP_STATE["extractor"]
+
+    def load_tile(c: dict) -> Optional["torch.Tensor"]:
+        try:
+            raw = _fetch_tile_bytes(c["z"], c["x"], c["y"], max_attempts=3)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if aspect_correct:
+                img = _apply_aspect_correction(img, tile_center_deg(c["z"], c["x"], c["y"])[0])
+            return transform(img)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        tensors = list(pool.map(load_tile, candidates))
+
+    kept_idx = [i for i, t in enumerate(tensors) if t is not None]
+    if not kept_idx:
+        return candidates  # fall back to PQ scores
+    batch = torch.stack([tensors[i] for i in kept_idx], dim=0)
+    vecs = extractor.extract(batch).astype("float32")
+    faiss.normalize_L2(vecs)
+    # qvec is (1, D) and already normalized.
+    exact = (vecs @ qvec[0].astype("float32")).tolist()
+    for local, ci in enumerate(kept_idx):
+        candidates[ci]["pq_similarity"] = candidates[ci]["similarity"]
+        candidates[ci]["similarity"] = float(exact[local])
+    candidates.sort(key=lambda c: c["similarity"], reverse=True)
+    return candidates
+
+
 def _nms_spatial(results: list[dict], top_k: int, min_separation_tiles: int) -> list[dict]:
     """Greedy non-maximum suppression by tile-index distance. Results are
     expected to be sorted by similarity desc. `min_separation_tiles` is the
@@ -580,13 +627,20 @@ def _search(
     zoom: Optional[int] = None,
     spatial_diversity: bool = False,
     diversity_tiles: int = 4,
+    rerank: bool = True,
+    rerank_candidates: int = 60,
 ) -> list[dict]:
     state = APP_STATE["indices"][zoom] if zoom in APP_STATE["indices"] else None
     if state is None:
         z = APP_STATE["default_zoom"]
         state = APP_STATE["indices"][z]
-    # Oversample when diversity is on so NMS has room to suppress clusters.
-    fetch_k = top_k * 8 if spatial_diversity else top_k
+    # Oversample: more when diversity is on (NMS needs room), more when
+    # rerank is on (exact scores reorder the PQ candidates).
+    fetch_k = top_k
+    if spatial_diversity:
+        fetch_k = max(fetch_k, top_k * 8)
+    if rerank:
+        fetch_k = max(fetch_k, rerank_candidates)
     distances, indices = state["index"].search(vec, fetch_k)
     md: pd.DataFrame = state["metadata"]
     results = []
@@ -607,6 +661,8 @@ def _search(
                 "tile_bounds": list(tile_bounds_deg(z_i, x_i, y_i)),
             }
         )
+    if rerank:
+        results = _rerank_cls_candidates(vec, results, zoom=(zoom if zoom is not None else state["zoom"]))
     if spatial_diversity:
         results = _nms_spatial(results, top_k, diversity_tiles)
     else:
@@ -624,6 +680,7 @@ class LatLonQuery(BaseModel):
     top_k: int = 20
     spatial_diversity: bool = False
     diversity_tiles: int = 4
+    rerank: bool = True
 
 
 class BboxQuery(BaseModel):
@@ -633,10 +690,11 @@ class BboxQuery(BaseModel):
     lon_max: float
     zoom: Optional[int] = None  # at which zoom to fetch source pixels
     top_k: int = 20
-    mode: str = "composite"  # "composite" | "aggregate" | "multi"
+    mode: str = "composite"  # "composite" | "aggregate" | "multi" | "patch"
     localize: bool = False  # find best sub-region within each result tile
     spatial_diversity: bool = False
     diversity_tiles: int = 4
+    rerank: bool = True
 
 
 @app.post("/api/query_bbox")
@@ -702,6 +760,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             vec, q.top_k, zoom=search_zoom,
             spatial_diversity=q.spatial_diversity,
             diversity_tiles=q.diversity_tiles,
+            rerank=q.rerank,
         )
         preview_img = region_img.copy()
     elif mode == "patch":
@@ -756,6 +815,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 mean_vec, q.top_k, zoom=search_zoom,
                 spatial_diversity=q.spatial_diversity,
                 diversity_tiles=q.diversity_tiles,
+                rerank=q.rerank,
             )
         elif mode == "multi":
             # Run one search per constituent, merge by best similarity per
@@ -765,6 +825,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
             for v in vecs_np:
                 hits = _search(
                     v.reshape(1, -1), q.top_k, zoom=search_zoom,
+                    rerank=q.rerank,
                 )
                 for h in hits:
                     key = (h["z"], h["x"], h["y"])
@@ -895,6 +956,7 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
         vec, q.top_k, zoom=index_zoom,
         spatial_diversity=q.spatial_diversity,
         diversity_tiles=q.diversity_tiles,
+        rerank=q.rerank,
     )
     return JSONResponse(
         {
