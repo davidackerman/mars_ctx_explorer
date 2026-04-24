@@ -353,6 +353,15 @@ def _tile_range_for_bbox(
     return x_min, x_max, y_min, y_max
 
 
+def _image_is_mostly_black(img: Image.Image, threshold: float = 10.0, min_valid: float = 0.15) -> bool:
+    """Heuristic: is at least `min_valid` fraction of the image brighter than
+    `threshold` (0-255)? True = image is dominated by black placeholder pixels
+    from failed tile fetches."""
+    arr = np.asarray(img.convert("L"))
+    valid = float((arr > threshold).mean())
+    return valid < min_valid
+
+
 def _fetch_bbox_composite(
     z: int, lat_min: float, lat_max: float, lon_min: float, lon_max: float
 ) -> Image.Image:
@@ -603,6 +612,10 @@ def _rerank_cls_candidates(
         try:
             raw = _fetch_tile_bytes(c["z"], c["x"], c["y"], max_attempts=3)
             img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if _image_is_mostly_black(img, min_valid=0.05):
+                # Polar/void tiles skew re-rank scores toward 1.0 for any
+                # also-dark query. Drop them from the candidate pool.
+                return None
             if aspect_correct:
                 img = _apply_aspect_correction(img, tile_center_deg(c["z"], c["x"], c["y"])[0])
             return transform(img)
@@ -774,6 +787,11 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         region_img = _fetch_bbox_composite(
             fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
+        if _image_is_mostly_black(region_img):
+            raise HTTPException(
+                status_code=502,
+                detail="Query region is mostly empty — ArcGIS tile fetches likely failed. Retry in a moment.",
+            )
         if aspect_correct_query:
             center_lat = 0.5 * (q.lat_min + q.lat_max)
             cos_lat = max(0.05, math.cos(math.radians(abs(center_lat))))
@@ -793,14 +811,19 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
     elif mode == "patch":
         # True sub-tile retrieval against the pre-built global patch index.
         # Every patch of every tile is a candidate.
+        preview_img = _fetch_bbox_composite(
+            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        )
+        if _image_is_mostly_black(preview_img):
+            raise HTTPException(
+                status_code=502,
+                detail="Query region is mostly empty — ArcGIS tile fetches likely failed. Retry in a moment.",
+            )
         results = _search_patches(
             q.lat_min, q.lat_max, q.lon_min, q.lon_max,
             fetch_z, search_zoom, q.top_k,
             spatial_diversity=q.spatial_diversity,
             diversity_tiles=q.diversity_tiles,
-        )
-        preview_img = _fetch_bbox_composite(
-            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
     else:
         # Fetch each intersecting tile at the SEARCH zoom (not the fetch
