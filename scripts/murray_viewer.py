@@ -459,6 +459,77 @@ def _patch_bounds_deg(
     return p_lat_min, p_lat_max, p_lon_min, p_lon_max
 
 
+def _rerank_patch_groups(
+    qvec: np.ndarray, candidates: list[dict], grid_n: int, aspect_correct: bool,
+) -> list[dict]:
+    """Replace PQ-compressed patch scores with exact cosines. For each
+    candidate rectangle, re-fetch the containing tile, re-embed its full
+    patch grid in one DINO forward (batched across all unique tiles),
+    mean-pool the patches INSIDE the candidate's patch bbox, and dot
+    against the mean-pooled query vector."""
+    import faiss
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not candidates:
+        return candidates
+    transform = APP_STATE["transform"]
+    extractor = APP_STATE["extractor"]
+
+    # One mean-pooled query vector (unit-normalized) to match against.
+    qmean = qvec.mean(axis=0, keepdims=True).astype("float32")
+    faiss.normalize_L2(qmean)
+
+    unique: dict[tuple[int, int, int], int] = {}
+    for c in candidates:
+        unique.setdefault((c["z"], c["x"], c["y"]), len(unique))
+
+    def load(k):
+        z, x, y = k
+        try:
+            raw = _fetch_tile_bytes(z, x, y, max_attempts=3)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if aspect_correct:
+                img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
+            if _image_is_mostly_black(img, min_valid=0.05):
+                return k, None
+            return k, transform(img)
+        except Exception:
+            return k, None
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(load, unique.keys()))
+
+    keys = [k for k, t in results if t is not None]
+    tensors = [t for _, t in results if t is not None]
+    if not tensors:
+        return candidates
+    batch = torch.stack(tensors, dim=0)
+    all_patches = extractor.extract_patches(batch).astype("float32")  # (B, P, D)
+    # Normalize per-patch to match how the index was built.
+    norms = np.linalg.norm(all_patches, axis=-1, keepdims=True)
+    all_patches = all_patches / (norms + 1e-12)
+    key_to_patches = {k: all_patches[i] for i, k in enumerate(keys)}
+
+    for c in candidates:
+        patches = key_to_patches.get((c["z"], c["x"], c["y"]))
+        if patches is None:
+            continue
+        r0, r1 = c["patch_row_min"], c["patch_row_max"]
+        c0, c1 = c["patch_col_min"], c["patch_col_max"]
+        selected = np.stack([
+            patches[pr * grid_n + pc]
+            for pr in range(r0, r1 + 1)
+            for pc in range(c0, c1 + 1)
+        ])
+        region = selected.mean(axis=0, keepdims=True).astype("float32")
+        faiss.normalize_L2(region)
+        exact = float((region @ qmean.T)[0, 0])
+        c["pq_similarity"] = c["similarity"]
+        c["similarity"] = exact
+    candidates.sort(key=lambda x: x["similarity"], reverse=True)
+    return candidates
+
+
 def _search_patches(
     lat_min: float, lat_max: float, lon_min: float, lon_max: float,
     fetch_z: int, search_zoom: int, top_k: int,
@@ -502,6 +573,16 @@ def _search_patches(
     D = int(qpatches.shape[2])
     qvec = qpatches.reshape(Q, D)
     faiss.normalize_L2(qvec)
+
+    # Expected result shape: how many patches wide/tall the user's query
+    # region spans at the search zoom. We cap merged result rectangles to
+    # roughly these dimensions so a small query doesn't get answered with
+    # a whole-tile match.
+    patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
+    qry_patch_rows = max(1, int(round((lat_max - lat_min) / patch_deg)))
+    qry_patch_cols = max(1, int(round((lon_max - lon_min) / patch_deg)))
+    max_rows = min(grid_n, max(qry_patch_rows + 1, int(round(qry_patch_rows * 1.5))))
+    max_cols = min(grid_n, max(qry_patch_cols + 1, int(round(qry_patch_cols * 1.5))))
 
     # Oversample per-patch hits so the grouping pass below has something to
     # merge. Faiss returns (Q, per_query_k).
@@ -550,6 +631,27 @@ def _search_patches(
                         npi = nr * grid_n + nc
                         if npi in pi_scores and npi not in visited:
                             stack.append(npi)
+
+            # Cap the component to roughly the query's patch-grid dimensions,
+            # so a small query can't get answered with a whole-tile result.
+            rows = [p // grid_n for p in comp]
+            cols = [p % grid_n for p in comp]
+            r0, r1 = min(rows), max(rows)
+            c0, c1 = min(cols), max(cols)
+            if (r1 - r0 + 1) > max_rows or (c1 - c0 + 1) > max_cols:
+                peak = max(comp, key=lambda p: pi_scores[p])
+                pr, pc = peak // grid_n, peak % grid_n
+                hr = max_rows // 2
+                hc = max_cols // 2
+                wr0 = max(0, pr - hr)
+                wr1 = min(grid_n - 1, wr0 + max_rows - 1)
+                wc0 = max(0, pc - hc)
+                wc1 = min(grid_n - 1, wc0 + max_cols - 1)
+                comp = {
+                    p for p in comp
+                    if wr0 <= p // grid_n <= wr1 and wc0 <= p % grid_n <= wc1
+                }
+
             scores = [pi_scores[p] for p in comp]
             groups.append((trid, comp, max(scores), sum(scores) / len(scores)))
 
@@ -604,9 +706,13 @@ def _search_patches(
             "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
         })
-        if len(out) >= top_k:
+        if len(out) >= top_k * 3:
+            # Oversample before rerank so exact scores can re-order; final
+            # trim happens after _rerank_patch_groups.
             break
-    return out
+
+    out = _rerank_patch_groups(qvec, out, grid_n=grid_n, aspect_correct=aspect_correct)
+    return out[:top_k]
 
 
 def _rerank_cls_candidates(
