@@ -94,8 +94,12 @@ def _load_single_index(index_dir: Path) -> dict:
     # nprobe=32 on nlist~1331 gets us well above 95% recall@10 at ~20-30 ms
     # per query (still interactive).
     if isinstance(index, faiss.IndexIVF):
-        index.nprobe = 32
-        logger.info("Set nprobe=32 on IVF index at %s (nlist=%d)", index_dir, index.nlist)
+        # Earlier nprobe=32 left about 1/5 of tiles orphaned at query time
+        # (diagnostic showed 2/10 sampled tiles couldn't find themselves in
+        # the top-50 at nprobe=32). 128 raises per-query work to ~60 ms
+        # while roughly halving orphan misses. Flat-rerank is the real fix.
+        index.nprobe = 128
+        logger.info("Set nprobe=128 on IVF index at %s (nlist=%d)", index_dir, index.nlist)
     return {
         "index_dir": index_dir,
         "index": index,
