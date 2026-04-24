@@ -443,12 +443,12 @@ def _search_patches(
     qvec = qpatches.reshape(Q, D)
     faiss.normalize_L2(qvec)
 
-    # Search all query patches at once. Faiss returns (Q, per_query_k).
-    per_query_k = max(8, top_k // max(1, Q) * 4)
-    fetch_k = per_query_k * (8 if spatial_diversity else 1)
-    distances, indices = patch_index.search(qvec, fetch_k)
+    # Oversample per-patch hits so the grouping pass below has something to
+    # merge. Faiss returns (Q, per_query_k).
+    per_query_k = max(16, top_k * 3 // max(1, Q) + 4)
+    distances, indices = patch_index.search(qvec, per_query_k)
 
-    # Merge: key by (tile_row_id, patch_idx) → best similarity across query patches
+    # Collect best score per (tile_row_id, patch_idx) across query patches.
     best: dict[tuple[int, int], float] = {}
     for qi in range(Q):
         for score, idx in zip(distances[qi], indices[qi]):
@@ -461,39 +461,85 @@ def _search_patches(
             if prev is None or score > prev:
                 best[key] = float(score)
 
-    ranked = sorted(best.items(), key=lambda kv: kv[1], reverse=True)
-    out: list[dict] = []
-    seen_tile_and_patch: list[tuple[int, int, int, int, int]] = []  # (z, x, y, pr, pc)
+    # Group spatially-adjacent hit patches within the same tile into
+    # rectangular regions (4-connected BFS over the 14x14 patch grid). If
+    # the user drew a long stripe and several adjacent patches all matched,
+    # we return one long-stripe rectangle instead of a bunch of squares.
+    by_tile: dict[int, dict[int, float]] = {}
+    for (trid, pi), score in best.items():
+        by_tile.setdefault(trid, {})[pi] = score
 
-    for (tile_row_id, patch_idx), score in ranked:
-        if tile_row_id >= len(tiles_df):
+    groups: list[tuple[int, set[int], float, float]] = []  # (trid, patches, best, mean)
+    for trid, pi_scores in by_tile.items():
+        visited: set[int] = set()
+        for start in pi_scores:
+            if start in visited:
+                continue
+            comp: set[int] = set()
+            stack = [start]
+            while stack:
+                pi = stack.pop()
+                if pi in visited:
+                    continue
+                visited.add(pi)
+                comp.add(pi)
+                r, c = pi // grid_n, pi % grid_n
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < grid_n and 0 <= nc < grid_n:
+                        npi = nr * grid_n + nc
+                        if npi in pi_scores and npi not in visited:
+                            stack.append(npi)
+            scores = [pi_scores[p] for p in comp]
+            groups.append((trid, comp, max(scores), sum(scores) / len(scores)))
+
+    # Rank groups by best-patch score (keeps per-patch ranking semantics),
+    # break ties by mean score × size so coherent multi-patch regions win.
+    groups.sort(key=lambda g: (g[2], g[3] * math.log1p(len(g[1]))), reverse=True)
+
+    out: list[dict] = []
+    seen_tile_and_patch: list[tuple[int, int, int, int, int]] = []
+
+    for trid, patches, best_sim, mean_sim in groups:
+        if trid >= len(tiles_df):
             continue
-        row = tiles_df.iloc[tile_row_id]
+        row = tiles_df.iloc[trid]
         t_z, t_x, t_y = int(row.z), int(row.x), int(row.y)
-        pr, pc = patch_idx // grid_n, patch_idx % grid_n
+        rows = [pi // grid_n for pi in patches]
+        cols = [pi % grid_n for pi in patches]
+        r0, r1 = min(rows), max(rows)
+        c0, c1 = min(cols), max(cols)
         if spatial_diversity:
+            cr = (r0 + r1) / 2
+            cc = (c0 + c1) / 2
             too_close = False
             for (sz, sx, sy, spr, spc) in seen_tile_and_patch:
                 if sz != t_z:
                     continue
-                dx = (sx - t_x) * grid_n + (spc - pc)
-                dy = (sy - t_y) * grid_n + (spr - pr)
+                dx = (sx - t_x) * grid_n + (spc - cc)
+                dy = (sy - t_y) * grid_n + (spr - cr)
                 if max(abs(dx), abs(dy)) < diversity_tiles * grid_n:
                     too_close = True
                     break
             if too_close:
                 continue
-            seen_tile_and_patch.append((t_z, t_x, t_y, pr, pc))
-        p_lat_min, p_lat_max, p_lon_min, p_lon_max = _patch_bounds_deg(
-            t_z, t_x, t_y, pr, pc, grid_n
-        )
-        center_lat = 0.5 * (p_lat_min + p_lat_max)
-        center_lon = 0.5 * (p_lon_min + p_lon_max)
+            seen_tile_and_patch.append((t_z, t_x, t_y, cr, cc))
+        # Lat/lon bounds = union of top-left and bottom-right patch cells.
+        tl = _patch_bounds_deg(t_z, t_x, t_y, r0, c0, grid_n)
+        br = _patch_bounds_deg(t_z, t_x, t_y, r1, c1, grid_n)
+        p_lat_min = min(tl[0], br[0])
+        p_lat_max = max(tl[1], br[1])
+        p_lon_min = min(tl[2], br[2])
+        p_lon_max = max(tl[3], br[3])
         out.append({
             "z": t_z, "x": t_x, "y": t_y,
-            "patch_row": pr, "patch_col": pc,
-            "lat": center_lat, "lon": center_lon,
-            "similarity": score,
+            "patch_row_min": r0, "patch_row_max": r1,
+            "patch_col_min": c0, "patch_col_max": c1,
+            "patch_count": len(patches),
+            "lat": 0.5 * (p_lat_min + p_lat_max),
+            "lon": 0.5 * (p_lon_min + p_lon_max),
+            "similarity": best_sim,
+            "mean_similarity": mean_sim,
             "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
             "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
@@ -1451,9 +1497,10 @@ function renderQuery(q) {
     return;
   }
   const onErr = `this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'`;
+  const b64 = q.preview_b64 || q.preview_png_b64;
   const preview = q.tile_url
     ? `<img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333" onerror="${onErr}"/>`
-    : (q.preview_png_b64 ? `<img src="data:image/png;base64,${q.preview_png_b64}" style="width:100%;max-width:320px;border:1px solid #333"/>` : "");
+    : (b64 ? `<img src="data:image/jpeg;base64,${b64}" style="width:100%;max-width:320px;border:1px solid #333"/>` : "");
   const loc = (q.z !== undefined && q.x !== undefined)
     ? `z=${q.z} • tile (${q.x},${q.y})`
     : (q.bbox ? `bbox lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}` : "");
