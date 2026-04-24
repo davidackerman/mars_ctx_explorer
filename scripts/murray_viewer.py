@@ -362,6 +362,26 @@ def _image_is_mostly_black(img: Image.Image, threshold: float = 10.0, min_valid:
     return valid < min_valid
 
 
+def _fetch_bbox_with_fallback(
+    start_z: int, lat_min: float, lat_max: float, lon_min: float, lon_max: float,
+    min_z: int = 3,
+) -> tuple[Image.Image, int]:
+    """Try to composite at start_z; if the result is mostly empty (upstream
+    tiles failed), fall back to progressively coarser zooms until we get a
+    populated image. This matches what the user saw on the Cesium globe,
+    which often renders coarser LODs than our CLS index's native zoom."""
+    for z in range(start_z, min_z - 1, -1):
+        try:
+            img = _fetch_bbox_composite(z, lat_min, lat_max, lon_min, lon_max)
+        except HTTPException:
+            continue
+        if not _image_is_mostly_black(img):
+            return img, z
+    # All zooms failed — return the last attempt at start_z so the caller
+    # can surface a clear retry-able error.
+    return _fetch_bbox_composite(start_z, lat_min, lat_max, lon_min, lon_max), start_z
+
+
 def _fetch_bbox_composite(
     z: int, lat_min: float, lat_max: float, lon_min: float, lon_max: float
 ) -> Image.Image:
@@ -784,14 +804,17 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
     if mode == "composite":
         # One forward pass over the entire composited region → one query
         # vector. Matches "this whole region's overall signature."
-        region_img = _fetch_bbox_composite(
+        region_img, used_fetch_z = _fetch_bbox_with_fallback(
             fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
         if _image_is_mostly_black(region_img):
             raise HTTPException(
                 status_code=502,
-                detail="Query region is mostly empty — ArcGIS tile fetches likely failed. Retry in a moment.",
+                detail="Query region is empty at every available zoom — upstream tile server is failing. Retry in a moment.",
             )
+        if used_fetch_z != fetch_z:
+            logger.info("Composite fell back from z=%d to z=%d", fetch_z, used_fetch_z)
+        fetch_z = used_fetch_z
         if aspect_correct_query:
             center_lat = 0.5 * (q.lat_min + q.lat_max)
             cos_lat = max(0.05, math.cos(math.radians(abs(center_lat))))
@@ -811,14 +834,17 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
     elif mode == "patch":
         # True sub-tile retrieval against the pre-built global patch index.
         # Every patch of every tile is a candidate.
-        preview_img = _fetch_bbox_composite(
+        preview_img, used_fetch_z = _fetch_bbox_with_fallback(
             fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
         if _image_is_mostly_black(preview_img):
             raise HTTPException(
                 status_code=502,
-                detail="Query region is mostly empty — ArcGIS tile fetches likely failed. Retry in a moment.",
+                detail="Query region is empty at every available zoom — upstream tile server is failing. Retry in a moment.",
             )
+        if used_fetch_z != fetch_z:
+            logger.info("Patch composite fell back from z=%d to z=%d", fetch_z, used_fetch_z)
+        fetch_z = used_fetch_z
         results = _search_patches(
             q.lat_min, q.lat_max, q.lon_min, q.lon_max,
             fetch_z, search_zoom, q.top_k,
