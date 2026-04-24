@@ -557,21 +557,83 @@ def _search_patches(
     z_i = state["zoom"]
     aspect_correct = bool(state["sidecar"].get("aspect_corrected", False))
 
-    region_img = _fetch_bbox_composite(fetch_z, lat_min, lat_max, lon_min, lon_max)
-    if aspect_correct:
-        center_lat = 0.5 * (lat_min + lat_max)
-        cos_lat = max(0.05, math.cos(math.radians(abs(center_lat))))
-        if cos_lat < 0.999:
-            new_w = max(32, int(round(region_img.width * cos_lat)))
-            region_img = region_img.resize((new_w, region_img.height), Image.LANCZOS)
-
+    # Embed the query at the SAME scale as the index. Instead of cropping
+    # the user's bbox and running DINO on a resized 224x224 crop (which gives
+    # a different embedding than what the index stored for those patches),
+    # we fetch every tile the bbox intersects, run DINO on the *whole tile*
+    # (same forward as the indexer did), and select only the patches that
+    # spatially fall inside the bbox. Those patches ARE the indexed vectors
+    # for this region — so self-match becomes exact.
     transform = APP_STATE["transform"]
     extractor = APP_STATE["extractor"]
-    tensor = transform(region_img).unsqueeze(0)
-    qpatches = extractor.extract_patches(tensor).astype("float32")  # (1, Q, D)
-    Q = int(qpatches.shape[1])
-    D = int(qpatches.shape[2])
-    qvec = qpatches.reshape(Q, D)
+
+    x0, x1, y0, y1 = _tile_range_for_bbox(z_i, lat_min, lat_max, lon_min, lon_max)
+    tile_xys = [
+        (tx, ty) for ty in range(y0, y1 + 1) for tx in range(x0, x1 + 1)
+    ]
+    if len(tile_xys) > 16:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Region spans {len(tile_xys)} tiles at z={z_i}; pick a smaller box.",
+        )
+    tile_tensors = []
+    ok_tiles: list[tuple[int, int]] = []
+    for tx, ty in tile_xys:
+        try:
+            raw = _fetch_tile_bytes(z_i, tx, ty, max_attempts=4)
+        except HTTPException:
+            continue
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+        if _image_is_mostly_black(img, min_valid=0.05):
+            continue
+        if aspect_correct:
+            img = _apply_aspect_correction(img, tile_center_deg(z_i, tx, ty)[0])
+        tile_tensors.append(transform(img))
+        ok_tiles.append((tx, ty))
+    if not tile_tensors:
+        raise HTTPException(
+            status_code=502,
+            detail="Upstream tiles for this region all failed — retry in a moment.",
+        )
+    batch = torch.stack(tile_tensors, dim=0)
+    all_patches = extractor.extract_patches(batch).astype("float32")  # (B, P, D)
+    norms = np.linalg.norm(all_patches, axis=-1, keepdims=True)
+    all_patches = all_patches / (norms + 1e-12)
+
+    # Collect the patches that geographically fall inside the user's bbox.
+    selected: list[np.ndarray] = []
+    for i, (tx, ty) in enumerate(ok_tiles):
+        t_lat_min, t_lat_max, t_lon_min, t_lon_max = tile_bounds_deg(z_i, tx, ty)
+        d_lat = (t_lat_max - t_lat_min) / grid_n
+        d_lon = (t_lon_max - t_lon_min) / grid_n
+        for pr in range(grid_n):
+            p_lat_max = t_lat_max - pr * d_lat
+            p_lat_min = p_lat_max - d_lat
+            if p_lat_max <= lat_min or p_lat_min >= lat_max:
+                continue
+            for pc in range(grid_n):
+                p_lon_min = t_lon_min + pc * d_lon
+                p_lon_max = p_lon_min + d_lon
+                if p_lon_max <= lon_min or p_lon_min >= lon_max:
+                    continue
+                selected.append(all_patches[i, pr * grid_n + pc])
+    if not selected:
+        # Sub-patch bbox — snap to the one patch that contains its centre.
+        cx_lat = 0.5 * (lat_min + lat_max)
+        cx_lon = 0.5 * (lon_min + lon_max)
+        i = 0
+        tx, ty = ok_tiles[i]
+        t_lat_min, t_lat_max, t_lon_min, t_lon_max = tile_bounds_deg(z_i, tx, ty)
+        d_lat = (t_lat_max - t_lat_min) / grid_n
+        d_lon = (t_lon_max - t_lon_min) / grid_n
+        pr = int((t_lat_max - cx_lat) / d_lat)
+        pc = int((cx_lon - t_lon_min) / d_lon)
+        pr = max(0, min(grid_n - 1, pr))
+        pc = max(0, min(grid_n - 1, pc))
+        selected.append(all_patches[i, pr * grid_n + pc])
+    qvec = np.stack(selected, axis=0).astype("float32")  # (Qsel, D)
+    Q = qvec.shape[0]
+    D = qvec.shape[1]
     faiss.normalize_L2(qvec)
 
     # Expected result shape: how many patches wide/tall the user's query
@@ -703,6 +765,10 @@ def _search_patches(
             "similarity": best_sim,
             "mean_similarity": mean_sim,
             "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
+            "patch_url": (
+                f"/api/tile_crop?z={t_z}&x={t_x}&y={t_y}"
+                f"&r0={r0}&c0={c0}&r1={r1}&c1={c1}&grid_n={grid_n}"
+            ),
             "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
         })
@@ -1227,6 +1293,29 @@ def api_anomalies(k: int = 20) -> JSONResponse:
             }
         )
     return JSONResponse({"anomalies": payload})
+
+
+@app.get("/api/tile_crop")
+def api_tile_crop(z: int, x: int, y: int, r0: int, c0: int, r1: int, c1: int, grid_n: int = 14) -> Response:
+    """Return just the sub-rectangle of tile (z,x,y) that spans patch grid
+    cells [r0..r1] x [c0..c1]. Used by the result thumbnails so users see
+    the actual matched sub-region, not the full 10 km tile."""
+    content = _fetch_tile_bytes(z, x, y, max_attempts=3)
+    img = Image.open(io.BytesIO(content)).convert("RGB")
+    px = img.width / grid_n
+    py = img.height / grid_n
+    box = (
+        int(round(c0 * px)), int(round(r0 * py)),
+        int(round((c1 + 1) * px)), int(round((r1 + 1) * py)),
+    )
+    crop = img.crop(box)
+    buf = io.BytesIO()
+    crop.save(buf, format="JPEG", quality=85)
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/tile_img")
@@ -1769,8 +1858,9 @@ function renderResults(results, scoreCol) {
     const row = document.createElement("div");
     row.className = "result";
     const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
+    const thumbUrl = r.patch_url || r.tile_url;
     row.innerHTML = `
-      <img src="${r.tile_url}" loading="lazy" onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
+      <img src="${thumbUrl}" loading="lazy" onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
       <div class="meta">
         <div><b>#${idx + 1}</b></div>
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
@@ -1826,9 +1916,10 @@ function renderResults(results, scoreCol) {
       viewer.camera.flyTo({
         destination: Cesium.Cartesian3.fromDegrees(r.lon, r.lat, 400_000, marsEllipsoid),
       });
+      const previewUrl = r.patch_url || r.tile_url;
       document.getElementById("result-preview").innerHTML = `
         <h3>Result #${idx + 1} preview</h3>
-        <img src="${r.tile_url}" style="width:100%;max-width:320px;border:1px solid #333"
+        <img src="${previewUrl}" style="width:100%;max-width:320px;border:1px solid #333"
              onerror="this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'"/>
         <p class="muted">z=${r.z} • tile (${r.x},${r.y}) • lat ${r.lat.toFixed(2)} lon ${r.lon.toFixed(2)} • ${scoreCol}: ${score?.toFixed(3)}</p>`;
     };
