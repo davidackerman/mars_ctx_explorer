@@ -636,120 +636,91 @@ def _search_patches(
     D = qvec.shape[1]
     faiss.normalize_L2(qvec)
 
-    # Expected result shape: how many patches wide/tall the user's query
-    # region spans at the search zoom. We cap merged result rectangles to
-    # roughly these dimensions so a small query doesn't get answered with
-    # a whole-tile match.
+    # Query shape (in patch grid units). The query may span a sub-patch
+    # bbox (1×1) up to 14×14 (a whole tile). Result rectangles will be
+    # forced to the same shape via sliding-window matching below.
     patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
-    qry_patch_rows = max(1, int(round((lat_max - lat_min) / patch_deg)))
-    qry_patch_cols = max(1, int(round((lon_max - lon_min) / patch_deg)))
-    max_rows = min(grid_n, max(qry_patch_rows + 1, int(round(qry_patch_rows * 1.5))))
-    max_cols = min(grid_n, max(qry_patch_cols + 1, int(round(qry_patch_cols * 1.5))))
+    qry_patch_rows = max(1, min(grid_n, int(round((lat_max - lat_min) / patch_deg))))
+    qry_patch_cols = max(1, min(grid_n, int(round((lon_max - lon_min) / patch_deg))))
 
-    # Oversample per-patch hits so the grouping pass below has something to
-    # merge. Faiss returns (Q, per_query_k).
-    per_query_k = max(16, top_k * 3 // max(1, Q) + 4)
-    distances, indices = patch_index.search(qvec, per_query_k)
+    # Mean-pooled query vector in unit-norm space.
+    qmean = qvec.mean(axis=0, keepdims=True).astype("float32")
+    faiss.normalize_L2(qmean)
 
-    # Collect best score per (tile_row_id, patch_idx) across query patches.
-    best: dict[tuple[int, int], float] = {}
+    # Step 1: shortlist candidate tiles via FAISS patch search. Any tile
+    # with at least one matching patch is a candidate; we'll re-score the
+    # tile properly with sliding-window cosine in step 2.
+    per_query_k = max(16, top_k * 4 // max(1, Q) + 8)
+    _dist, _idx = patch_index.search(qvec, per_query_k)
+    candidate_trids: dict[int, float] = {}
     for qi in range(Q):
-        for score, idx in zip(distances[qi], indices[qi]):
+        for score, idx in zip(_dist[qi], _idx[qi]):
             if idx < 0:
                 continue
-            tile_row_id = int(idx // P)
-            patch_idx = int(idx % P)
-            key = (tile_row_id, patch_idx)
-            prev = best.get(key)
-            if prev is None or score > prev:
-                best[key] = float(score)
+            trid = int(idx // P)
+            if score > candidate_trids.get(trid, -1.0):
+                candidate_trids[trid] = float(score)
+    # Limit shortlist size for re-rank cost.
+    shortlist = sorted(candidate_trids.items(), key=lambda kv: kv[1], reverse=True)[: top_k * 8]
 
-    # Group spatially-adjacent hit patches within the same tile into
-    # rectangular regions (4-connected BFS over the 14x14 patch grid). If
-    # the user drew a long stripe and several adjacent patches all matched,
-    # we return one long-stripe rectangle instead of a bunch of squares.
-    by_tile: dict[int, dict[int, float]] = {}
-    for (trid, pi), score in best.items():
-        by_tile.setdefault(trid, {})[pi] = score
+    # Step 2: fetch each candidate tile, DINO forward, slide a query-shaped
+    # window across the patch grid and score each window by exact mean cosine.
+    from concurrent.futures import ThreadPoolExecutor
 
-    groups: list[tuple[int, set[int], float, float]] = []  # (trid, patches, best, mean)
-    for trid, pi_scores in by_tile.items():
-        visited: set[int] = set()
-        for start in pi_scores:
-            if start in visited:
-                continue
-            comp: set[int] = set()
-            stack = [start]
-            while stack:
-                pi = stack.pop()
-                if pi in visited:
-                    continue
-                visited.add(pi)
-                comp.add(pi)
-                r, c = pi // grid_n, pi % grid_n
-                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                    nr, nc = r + dr, c + dc
-                    if 0 <= nr < grid_n and 0 <= nc < grid_n:
-                        npi = nr * grid_n + nc
-                        if npi in pi_scores and npi not in visited:
-                            stack.append(npi)
-
-            # Cap the component to roughly the query's patch-grid dimensions,
-            # so a small query can't get answered with a whole-tile result.
-            rows = [p // grid_n for p in comp]
-            cols = [p % grid_n for p in comp]
-            r0, r1 = min(rows), max(rows)
-            c0, c1 = min(cols), max(cols)
-            if (r1 - r0 + 1) > max_rows or (c1 - c0 + 1) > max_cols:
-                peak = max(comp, key=lambda p: pi_scores[p])
-                pr, pc = peak // grid_n, peak % grid_n
-                hr = max_rows // 2
-                hc = max_cols // 2
-                wr0 = max(0, pr - hr)
-                wr1 = min(grid_n - 1, wr0 + max_rows - 1)
-                wc0 = max(0, pc - hc)
-                wc1 = min(grid_n - 1, wc0 + max_cols - 1)
-                comp = {
-                    p for p in comp
-                    if wr0 <= p // grid_n <= wr1 and wc0 <= p % grid_n <= wc1
-                }
-
-            scores = [pi_scores[p] for p in comp]
-            groups.append((trid, comp, max(scores), sum(scores) / len(scores)))
-
-    # Rank groups by best-patch score (keeps per-patch ranking semantics),
-    # break ties by mean score × size so coherent multi-patch regions win.
-    groups.sort(key=lambda g: (g[2], g[3] * math.log1p(len(g[1]))), reverse=True)
-
-    out: list[dict] = []
-    seen_tile_and_patch: list[tuple[int, int, int, int, int]] = []
-
-    for trid, patches, best_sim, mean_sim in groups:
+    tile_keys: list[tuple[int, int, int, int]] = []  # (trid, z, x, y)
+    for trid, _ in shortlist:
         if trid >= len(tiles_df):
             continue
         row = tiles_df.iloc[trid]
-        t_z, t_x, t_y = int(row.z), int(row.x), int(row.y)
-        rows = [pi // grid_n for pi in patches]
-        cols = [pi % grid_n for pi in patches]
-        r0, r1 = min(rows), max(rows)
-        c0, c1 = min(cols), max(cols)
-        if spatial_diversity:
-            cr = (r0 + r1) / 2
-            cc = (c0 + c1) / 2
-            too_close = False
-            for (sz, sx, sy, spr, spc) in seen_tile_and_patch:
-                if sz != t_z:
-                    continue
-                dx = (sx - t_x) * grid_n + (spc - cc)
-                dy = (sy - t_y) * grid_n + (spr - cr)
-                if max(abs(dx), abs(dy)) < diversity_tiles * grid_n:
-                    too_close = True
-                    break
-            if too_close:
-                continue
-            seen_tile_and_patch.append((t_z, t_x, t_y, cr, cc))
-        # Lat/lon bounds = union of top-left and bottom-right patch cells.
-        tl = _patch_bounds_deg(t_z, t_x, t_y, r0, c0, grid_n)
+        tile_keys.append((trid, int(row.z), int(row.x), int(row.y)))
+
+    def load(item):
+        trid, z, x, y = item
+        try:
+            raw = _fetch_tile_bytes(z, x, y, max_attempts=3)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            if _image_is_mostly_black(img, min_valid=0.05):
+                return item, None
+            if aspect_correct:
+                img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
+            return item, transform(img)
+        except Exception:
+            return item, None
+
+    loaded: list[tuple[tuple, "torch.Tensor"]] = []
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for item, t in pool.map(load, tile_keys):
+            if t is not None:
+                loaded.append((item, t))
+
+    if not loaded:
+        return []
+
+    big_batch = torch.stack([t for _, t in loaded], dim=0)
+    cand_patches = extractor.extract_patches(big_batch).astype("float32")  # (B, P, D)
+    cn = np.linalg.norm(cand_patches, axis=-1, keepdims=True)
+    cand_patches = cand_patches / (cn + 1e-12)
+    # Reshape to (B, grid_n, grid_n, D) for sliding-window slicing.
+    cand_grid = cand_patches.reshape(len(loaded), grid_n, grid_n, D)
+
+    out: list[dict] = []
+    qmean_vec = qmean[0]  # (D,)
+    for ci, ((trid, t_z, t_x, t_y), _t) in enumerate(loaded):
+        grid = cand_grid[ci]  # (grid_n, grid_n, D)
+        best_score = -2.0
+        best_r0 = best_c0 = 0
+        for r0 in range(grid_n - qry_patch_rows + 1):
+            for c0 in range(grid_n - qry_patch_cols + 1):
+                window = grid[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
+                wmean = window.reshape(-1, D).mean(axis=0)
+                wmean = wmean / (np.linalg.norm(wmean) + 1e-12)
+                score = float(wmean @ qmean_vec)
+                if score > best_score:
+                    best_score = score
+                    best_r0, best_c0 = r0, c0
+        r1 = best_r0 + qry_patch_rows - 1
+        c1 = best_c0 + qry_patch_cols - 1
+        tl = _patch_bounds_deg(t_z, t_x, t_y, best_r0, best_c0, grid_n)
         br = _patch_bounds_deg(t_z, t_x, t_y, r1, c1, grid_n)
         p_lat_min = min(tl[0], br[0])
         p_lat_max = max(tl[1], br[1])
@@ -757,27 +728,43 @@ def _search_patches(
         p_lon_max = max(tl[3], br[3])
         out.append({
             "z": t_z, "x": t_x, "y": t_y,
-            "patch_row_min": r0, "patch_row_max": r1,
-            "patch_col_min": c0, "patch_col_max": c1,
-            "patch_count": len(patches),
+            "patch_row_min": best_r0, "patch_row_max": r1,
+            "patch_col_min": best_c0, "patch_col_max": c1,
+            "patch_count": qry_patch_rows * qry_patch_cols,
             "lat": 0.5 * (p_lat_min + p_lat_max),
             "lon": 0.5 * (p_lon_min + p_lon_max),
-            "similarity": best_sim,
-            "mean_similarity": mean_sim,
+            "similarity": best_score,
             "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
             "patch_url": (
                 f"/api/tile_crop?z={t_z}&x={t_x}&y={t_y}"
-                f"&r0={r0}&c0={c0}&r1={r1}&c1={c1}&grid_n={grid_n}"
+                f"&r0={best_r0}&c0={best_c0}&r1={r1}&c1={c1}&grid_n={grid_n}"
             ),
             "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
         })
-        if len(out) >= top_k * 3:
-            # Oversample before rerank so exact scores can re-order; final
-            # trim happens after _rerank_patch_groups.
-            break
+    out.sort(key=lambda d: d["similarity"], reverse=True)
 
-    out = _rerank_patch_groups(qvec, out, grid_n=grid_n, aspect_correct=aspect_correct)
+    if spatial_diversity:
+        kept: list[dict] = []
+        for r in out:
+            cr = (r["patch_row_min"] + r["patch_row_max"]) / 2
+            cc = (r["patch_col_min"] + r["patch_col_max"]) / 2
+            too_close = False
+            for k in kept:
+                if k["z"] != r["z"]:
+                    continue
+                kcr = (k["patch_row_min"] + k["patch_row_max"]) / 2
+                kcc = (k["patch_col_min"] + k["patch_col_max"]) / 2
+                dx = (k["x"] - r["x"]) * grid_n + (kcc - cc)
+                dy = (k["y"] - r["y"]) * grid_n + (kcr - cr)
+                if max(abs(dx), abs(dy)) < diversity_tiles * grid_n:
+                    too_close = True
+                    break
+            if not too_close:
+                kept.append(r)
+                if len(kept) >= top_k:
+                    break
+        return kept
     return out[:top_k]
 
 
