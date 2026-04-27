@@ -643,16 +643,56 @@ def _search_patches(
     qry_patch_rows = max(1, min(grid_n, int(round((lat_max - lat_min) / patch_deg))))
     qry_patch_cols = max(1, min(grid_n, int(round((lon_max - lon_min) / patch_deg))))
 
-    # Mean-pooled query vector in unit-norm space.
+    # Mean-pooled query vector in unit-norm space — patch-aligned path,
+    # gives self-match = 1.0.
     qmean = qvec.mean(axis=0, keepdims=True).astype("float32")
     faiss.normalize_L2(qmean)
 
-    # Step 1: shortlist candidate tiles via FAISS patch search. Any tile
-    # with at least one matching patch is a candidate; we'll re-score the
-    # tile properly with sliding-window cosine in step 2.
+    # Rotation-invariant augmentation: also embed the bbox crop at 90, 180,
+    # 270 degrees so a candidate that matches the query when rotated still
+    # surfaces. We score each candidate window against ALL of these query
+    # vectors and take the max similarity. Self-match remains exact (qmean
+    # is preserved verbatim in the stack).
+    def _rotated_query_means() -> list[np.ndarray]:
+        try:
+            crop = _fetch_bbox_composite(fetch_z, lat_min, lat_max, lon_min, lon_max)
+            if _image_is_mostly_black(crop):
+                return []
+            if aspect_correct:
+                cl = 0.5 * (lat_min + lat_max)
+                cos_lat = max(0.05, math.cos(math.radians(abs(cl))))
+                if cos_lat < 0.999:
+                    new_w = max(32, int(round(crop.width * cos_lat)))
+                    crop = crop.resize((new_w, crop.height), Image.LANCZOS)
+        except Exception:
+            return []
+        means = []
+        for angle in (0, 90, 180, 270):
+            rot = crop.rotate(angle, expand=True, resample=Image.BICUBIC) if angle else crop
+            try:
+                t = transform(rot).unsqueeze(0)
+                p = extractor.extract_patches(t).astype("float32")  # (1, 196, D)
+                pn = np.linalg.norm(p, axis=-1, keepdims=True)
+                p = p / (pn + 1e-12)
+                m = p.reshape(-1, p.shape[-1]).mean(axis=0, keepdims=True).astype("float32")
+                faiss.normalize_L2(m)
+                means.append(m)
+            except Exception:
+                continue
+        return means
+
+    qmeans_aug = _rotated_query_means()
+    # Stack: patch-aligned (self-match anchor) + rotated crop-DINO views.
+    all_qmeans = [qmean] + qmeans_aug
+
+    # Step 1: shortlist candidate tiles via FAISS patch search. Search
+    # against ALL augmented query views so rotated matches make the
+    # shortlist (a rotated crater wouldn't surface for the patch-aligned
+    # query alone).
     per_query_k = max(16, top_k * 4 // max(1, Q) + 8)
-    _dist, _idx = patch_index.search(qvec, per_query_k)
     candidate_trids: dict[int, float] = {}
+    # Per-patch FAISS for the patch-aligned query
+    _dist, _idx = patch_index.search(qvec, per_query_k)
     for qi in range(Q):
         for score, idx in zip(_dist[qi], _idx[qi]):
             if idx < 0:
@@ -660,7 +700,15 @@ def _search_patches(
             trid = int(idx // P)
             if score > candidate_trids.get(trid, -1.0):
                 candidate_trids[trid] = float(score)
-    # Limit shortlist size for re-rank cost.
+    # Per-rotation mean-vector FAISS to surface rotated candidates
+    for m in qmeans_aug:
+        _d2, _i2 = patch_index.search(m.astype("float32"), per_query_k)
+        for score, idx in zip(_d2[0], _i2[0]):
+            if idx < 0:
+                continue
+            trid = int(idx // P)
+            if score > candidate_trids.get(trid, -1.0):
+                candidate_trids[trid] = float(score)
     shortlist = sorted(candidate_trids.items(), key=lambda kv: kv[1], reverse=True)[: top_k * 8]
 
     # Step 2: fetch each candidate tile, DINO forward, slide a query-shaped
@@ -704,20 +752,28 @@ def _search_patches(
     cand_grid = cand_patches.reshape(len(loaded), grid_n, grid_n, D)
 
     out: list[dict] = []
-    qmean_vec = qmean[0]  # (D,)
+    # Stack all query views into a (V, D) matrix; per window we score against
+    # all of them and take the max — that's our rotation-invariant similarity.
+    qstack = np.concatenate(all_qmeans, axis=0).astype("float32")  # (V, D)
+
     for ci, ((trid, t_z, t_x, t_y), _t) in enumerate(loaded):
         grid = cand_grid[ci]  # (grid_n, grid_n, D)
         best_score = -2.0
         best_r0 = best_c0 = 0
+        best_view = 0
         for r0 in range(grid_n - qry_patch_rows + 1):
             for c0 in range(grid_n - qry_patch_cols + 1):
                 window = grid[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
                 wmean = window.reshape(-1, D).mean(axis=0)
                 wmean = wmean / (np.linalg.norm(wmean) + 1e-12)
-                score = float(wmean @ qmean_vec)
-                if score > best_score:
-                    best_score = score
+                # Score against every query view; pick the max.
+                scores = qstack @ wmean
+                vbest = int(scores.argmax())
+                s = float(scores[vbest])
+                if s > best_score:
+                    best_score = s
                     best_r0, best_c0 = r0, c0
+                    best_view = vbest
         r1 = best_r0 + qry_patch_rows - 1
         c1 = best_c0 + qry_patch_cols - 1
         tl = _patch_bounds_deg(t_z, t_x, t_y, best_r0, best_c0, grid_n)
@@ -726,6 +782,11 @@ def _search_patches(
         p_lat_max = max(tl[1], br[1])
         p_lon_min = min(tl[2], br[2])
         p_lon_max = max(tl[3], br[3])
+        # View 0 = patch-aligned upright; views 1..N are rotation-augmented
+        # crop-DINO views in 0/90/180/270 order. Map index back to degrees.
+        view_to_deg = {0: 0}
+        for vi in range(len(qmeans_aug)):
+            view_to_deg[1 + vi] = vi * 90
         out.append({
             "z": t_z, "x": t_x, "y": t_y,
             "patch_row_min": best_r0, "patch_row_max": r1,
@@ -734,6 +795,7 @@ def _search_patches(
             "lat": 0.5 * (p_lat_min + p_lat_max),
             "lon": 0.5 * (p_lon_min + p_lon_max),
             "similarity": best_score,
+            "match_rotation_deg": view_to_deg.get(best_view, 0),
             "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
             "patch_url": (
                 f"/api/tile_crop?z={t_z}&x={t_x}&y={t_y}"
@@ -1846,10 +1908,11 @@ function renderResults(results, scoreCol) {
     row.className = "result";
     const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
     const thumbUrl = r.patch_url || r.tile_url;
+    const rotTag = r.match_rotation_deg ? ` <span style="color:#ffe600">↻${r.match_rotation_deg}°</span>` : "";
     row.innerHTML = `
       <img src="${thumbUrl}" loading="lazy" onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
       <div class="meta">
-        <div><b>#${idx + 1}</b></div>
+        <div><b>#${idx + 1}</b>${rotTag}</div>
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
         <div>lat ${r.lat.toFixed(2)} • lon ${r.lon.toFixed(2)}</div>
       </div>`;
