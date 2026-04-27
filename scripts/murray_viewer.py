@@ -636,21 +636,31 @@ def _search_patches(
     D = qvec.shape[1]
     faiss.normalize_L2(qvec)
 
-    # Query shape (in patch grid units). The result-rectangle slides across
-    # one tile's 14×14 patch grid, so it can be at most grid_n in either
-    # axis. When the query is wider/taller than a single tile, scale BOTH
-    # axes proportionally so the result preserves the user's aspect ratio
-    # (e.g. a 30×3 query becomes 14×1, not 14×3).
+    # Query shape in patch grid units, NOT clipped to a single tile. If the
+    # query spans multiple tiles, we'll stitch a tile cluster around each
+    # FAISS candidate and slide the full-shape query window over the
+    # stitched grid. The cluster size cap below limits worst-case fetches.
     patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
-    raw_rows = max(1.0, (lat_max - lat_min) / patch_deg)
-    raw_cols = max(1.0, (lon_max - lon_min) / patch_deg)
-    longest = max(raw_rows, raw_cols)
-    if longest > grid_n:
-        scale = grid_n / longest
-        raw_rows *= scale
-        raw_cols *= scale
-    qry_patch_rows = max(1, min(grid_n, int(round(raw_rows))))
-    qry_patch_cols = max(1, min(grid_n, int(round(raw_cols))))
+    qry_patch_rows = max(1, int(round((lat_max - lat_min) / patch_deg)))
+    qry_patch_cols = max(1, int(round((lon_max - lon_min) / patch_deg)))
+    # k_y, k_x = how many tiles tall / wide the result rectangle spans.
+    k_y = max(1, math.ceil(qry_patch_rows / grid_n))
+    k_x = max(1, math.ceil(qry_patch_cols / grid_n))
+    # Hard cap so we don't fetch a 49-tile cluster per candidate.
+    MAX_K = 3
+    if k_y * k_x > MAX_K * MAX_K:
+        # Preserve aspect ratio while shrinking to fit the cap.
+        scale = math.sqrt((MAX_K * MAX_K) / (k_y * k_x))
+        new_rows = max(1, int(round(qry_patch_rows * scale)))
+        new_cols = max(1, int(round(qry_patch_cols * scale)))
+        qry_patch_rows, qry_patch_cols = new_rows, new_cols
+        k_y = max(1, math.ceil(qry_patch_rows / grid_n))
+        k_x = max(1, math.ceil(qry_patch_cols / grid_n))
+    cluster_rows = k_y * grid_n  # height of stitched patch grid
+    cluster_cols = k_x * grid_n
+    # Final cap so qry doesn't exceed the cluster.
+    qry_patch_rows = min(qry_patch_rows, cluster_rows)
+    qry_patch_cols = min(qry_patch_cols, cluster_cols)
 
     # Mean-pooled query vector in unit-norm space — patch-aligned path,
     # gives self-match = 1.0.
@@ -724,58 +734,88 @@ def _search_patches(
     # window across the patch grid and score each window by exact mean cosine.
     from concurrent.futures import ThreadPoolExecutor
 
-    tile_keys: list[tuple[int, int, int, int]] = []  # (trid, z, x, y)
+    # Anchor each candidate at the top-left of a (k_y × k_x) tile cluster.
+    # Build the unique set of tiles to fetch (clusters overlap heavily).
+    tiles_to_fetch: dict[tuple[int, int, int], "torch.Tensor"] = {}
+    candidate_clusters: list[tuple[int, int, int]] = []  # anchor (z, x, y)
     for trid, _ in shortlist:
         if trid >= len(tiles_df):
             continue
         row = tiles_df.iloc[trid]
-        tile_keys.append((trid, int(row.z), int(row.x), int(row.y)))
+        cz, cx, cy = int(row.z), int(row.x), int(row.y)
+        max_x = 2 * (2 ** cz) - 1
+        max_y = 1 * (2 ** cz) - 1
+        # Clamp the cluster top-left so we don't run off the right/bottom of
+        # the world.
+        ax = min(cx, max_x - (k_x - 1))
+        ay = min(cy, max_y - (k_y - 1))
+        ax = max(0, ax)
+        ay = max(0, ay)
+        candidate_clusters.append((cz, ax, ay))
+        for dy in range(k_y):
+            for dx in range(k_x):
+                tiles_to_fetch[(cz, ax + dx, ay + dy)] = None
 
-    def load(item):
-        trid, z, x, y = item
+    def load(key):
+        z, x, y = key
         try:
             raw = _fetch_tile_bytes(z, x, y, max_attempts=3)
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             if _image_is_mostly_black(img, min_valid=0.05):
-                return item, None
+                return key, None
             if aspect_correct:
                 img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
-            return item, transform(img)
+            return key, transform(img)
         except Exception:
-            return item, None
+            return key, None
 
-    loaded: list[tuple[tuple, "torch.Tensor"]] = []
     with ThreadPoolExecutor(max_workers=16) as pool:
-        for item, t in pool.map(load, tile_keys):
-            if t is not None:
-                loaded.append((item, t))
+        for key, t in pool.map(load, list(tiles_to_fetch.keys())):
+            tiles_to_fetch[key] = t
 
-    if not loaded:
+    keys_with_data = [k for k, v in tiles_to_fetch.items() if v is not None]
+    if not keys_with_data:
         return []
-
-    big_batch = torch.stack([t for _, t in loaded], dim=0)
+    big_batch = torch.stack([tiles_to_fetch[k] for k in keys_with_data], dim=0)
     cand_patches = extractor.extract_patches(big_batch).astype("float32")  # (B, P, D)
     cn = np.linalg.norm(cand_patches, axis=-1, keepdims=True)
     cand_patches = cand_patches / (cn + 1e-12)
-    # Reshape to (B, grid_n, grid_n, D) for sliding-window slicing.
-    cand_grid = cand_patches.reshape(len(loaded), grid_n, grid_n, D)
+    key_to_grid = {
+        k: cand_patches[i].reshape(grid_n, grid_n, D)
+        for i, k in enumerate(keys_with_data)
+    }
 
     out: list[dict] = []
-    # Stack all query views into a (V, D) matrix; per window we score against
-    # all of them and take the max — that's our rotation-invariant similarity.
+    seen_clusters: set[tuple[int, int, int]] = set()
     qstack = np.concatenate(all_qmeans, axis=0).astype("float32")  # (V, D)
 
-    for ci, ((trid, t_z, t_x, t_y), _t) in enumerate(loaded):
-        grid = cand_grid[ci]  # (grid_n, grid_n, D)
+    for cz, ax, ay in candidate_clusters:
+        if (cz, ax, ay) in seen_clusters:
+            continue
+        seen_clusters.add((cz, ax, ay))
+
+        # Stitch the (k_y × k_x) tiles into one (cluster_rows, cluster_cols, D) grid.
+        stitched = np.zeros((cluster_rows, cluster_cols, D), dtype="float32")
+        valid_mask = np.zeros((cluster_rows, cluster_cols), dtype=bool)
+        for dy in range(k_y):
+            for dx in range(k_x):
+                g = key_to_grid.get((cz, ax + dx, ay + dy))
+                if g is None:
+                    continue
+                stitched[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = g
+                valid_mask[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = True
+
         best_score = -2.0
         best_r0 = best_c0 = 0
         best_view = 0
-        for r0 in range(grid_n - qry_patch_rows + 1):
-            for c0 in range(grid_n - qry_patch_cols + 1):
-                window = grid[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
+        for r0 in range(cluster_rows - qry_patch_rows + 1):
+            for c0 in range(cluster_cols - qry_patch_cols + 1):
+                # Skip windows that overlap any failed-fetch tile.
+                if not valid_mask[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols].all():
+                    continue
+                window = stitched[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
                 wmean = window.reshape(-1, D).mean(axis=0)
                 wmean = wmean / (np.linalg.norm(wmean) + 1e-12)
-                # Score against every query view; pick the max.
                 scores = qstack @ wmean
                 vbest = int(scores.argmax())
                 s = float(scores[vbest])
@@ -783,34 +823,58 @@ def _search_patches(
                     best_score = s
                     best_r0, best_c0 = r0, c0
                     best_view = vbest
+
+        if best_score < -1.5:
+            continue  # all windows hit invalid tiles
+
+        # Translate (r0, c0) inside the stitched grid back to (tile_x, tile_y, patch_r, patch_c).
         r1 = best_r0 + qry_patch_rows - 1
         c1 = best_c0 + qry_patch_cols - 1
-        tl = _patch_bounds_deg(t_z, t_x, t_y, best_r0, best_c0, grid_n)
-        br = _patch_bounds_deg(t_z, t_x, t_y, r1, c1, grid_n)
+        anchor_tile_dx = best_c0 // grid_n
+        anchor_tile_dy = best_r0 // grid_n
+        anchor_tile_x = ax + anchor_tile_dx
+        anchor_tile_y = ay + anchor_tile_dy
+        # Bounds spanning all tiles the window touches.
+        end_tile_dx = c1 // grid_n
+        end_tile_dy = r1 // grid_n
+        tl = _patch_bounds_deg(
+            cz, ax + anchor_tile_dx, ay + anchor_tile_dy,
+            best_r0 - anchor_tile_dy * grid_n, best_c0 - anchor_tile_dx * grid_n, grid_n,
+        )
+        br = _patch_bounds_deg(
+            cz, ax + end_tile_dx, ay + end_tile_dy,
+            r1 - end_tile_dy * grid_n, c1 - end_tile_dx * grid_n, grid_n,
+        )
         p_lat_min = min(tl[0], br[0])
         p_lat_max = max(tl[1], br[1])
         p_lon_min = min(tl[2], br[2])
         p_lon_max = max(tl[3], br[3])
-        # View 0 = patch-aligned upright; views 1..N are rotation-augmented
-        # crop-DINO views in 0/90/180/270 order. Map index back to degrees.
         view_to_deg = {0: 0}
         for vi in range(len(qmeans_aug)):
             view_to_deg[1 + vi] = vi * 90
+        # Thumbnail: when the result spans multiple tiles, just point at the
+        # anchor tile crop (cropping a multi-tile composite would need a new
+        # endpoint; fall back to a tile-relative crop for now).
+        local_r0 = max(0, best_r0 - anchor_tile_dy * grid_n)
+        local_c0 = max(0, best_c0 - anchor_tile_dx * grid_n)
+        local_r1 = min(grid_n - 1, r1 - anchor_tile_dy * grid_n)
+        local_c1 = min(grid_n - 1, c1 - anchor_tile_dx * grid_n)
         out.append({
-            "z": t_z, "x": t_x, "y": t_y,
-            "patch_row_min": best_r0, "patch_row_max": r1,
-            "patch_col_min": best_c0, "patch_col_max": c1,
+            "z": cz, "x": anchor_tile_x, "y": anchor_tile_y,
+            "patch_row_min": local_r0, "patch_row_max": local_r1,
+            "patch_col_min": local_c0, "patch_col_max": local_c1,
             "patch_count": qry_patch_rows * qry_patch_cols,
+            "spans_tiles": (end_tile_dx - anchor_tile_dx + 1) * (end_tile_dy - anchor_tile_dy + 1),
             "lat": 0.5 * (p_lat_min + p_lat_max),
             "lon": 0.5 * (p_lon_min + p_lon_max),
             "similarity": best_score,
             "match_rotation_deg": view_to_deg.get(best_view, 0),
-            "tile_url": f"/api/tile_img?z={t_z}&x={t_x}&y={t_y}",
+            "tile_url": f"/api/tile_img?z={cz}&x={anchor_tile_x}&y={anchor_tile_y}",
             "patch_url": (
-                f"/api/tile_crop?z={t_z}&x={t_x}&y={t_y}"
-                f"&r0={best_r0}&c0={best_c0}&r1={r1}&c1={c1}&grid_n={grid_n}"
+                f"/api/tile_crop?z={cz}&x={anchor_tile_x}&y={anchor_tile_y}"
+                f"&r0={local_r0}&c0={local_c0}&r1={local_r1}&c1={local_c1}&grid_n={grid_n}"
             ),
-            "tile_bounds": list(tile_bounds_deg(t_z, t_x, t_y)),
+            "tile_bounds": list(tile_bounds_deg(cz, anchor_tile_x, anchor_tile_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
         })
     out.sort(key=lambda d: d["similarity"], reverse=True)
