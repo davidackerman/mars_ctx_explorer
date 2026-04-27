@@ -636,12 +636,21 @@ def _search_patches(
     D = qvec.shape[1]
     faiss.normalize_L2(qvec)
 
-    # Query shape (in patch grid units). The query may span a sub-patch
-    # bbox (1×1) up to 14×14 (a whole tile). Result rectangles will be
-    # forced to the same shape via sliding-window matching below.
+    # Query shape (in patch grid units). The result-rectangle slides across
+    # one tile's 14×14 patch grid, so it can be at most grid_n in either
+    # axis. When the query is wider/taller than a single tile, scale BOTH
+    # axes proportionally so the result preserves the user's aspect ratio
+    # (e.g. a 30×3 query becomes 14×1, not 14×3).
     patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
-    qry_patch_rows = max(1, min(grid_n, int(round((lat_max - lat_min) / patch_deg))))
-    qry_patch_cols = max(1, min(grid_n, int(round((lon_max - lon_min) / patch_deg))))
+    raw_rows = max(1.0, (lat_max - lat_min) / patch_deg)
+    raw_cols = max(1.0, (lon_max - lon_min) / patch_deg)
+    longest = max(raw_rows, raw_cols)
+    if longest > grid_n:
+        scale = grid_n / longest
+        raw_rows *= scale
+        raw_cols *= scale
+    qry_patch_rows = max(1, min(grid_n, int(round(raw_rows))))
+    qry_patch_cols = max(1, min(grid_n, int(round(raw_cols))))
 
     # Mean-pooled query vector in unit-norm space — patch-aligned path,
     # gives self-match = 1.0.
