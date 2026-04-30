@@ -821,6 +821,7 @@ def _search_patches(
         best_score = -2.0
         best_r0 = best_c0 = 0
         best_view = 0
+        best_cos_grid: Optional[np.ndarray] = None
         # Pre-mask query template by valid query patches (qmask) so partial
         # tile-fetch failures don't poison the score.
         q_valid = qmask
@@ -840,6 +841,7 @@ def _search_patches(
                     best_score = s
                     best_r0, best_c0 = r0, c0
                     best_view = 0
+                    best_cos_grid = cos_grid.copy()
 
         if best_score < -1.5:
             continue  # all windows hit invalid tiles
@@ -893,6 +895,11 @@ def _search_patches(
             ),
             "tile_bounds": list(tile_bounds_deg(cz, anchor_tile_x, anchor_tile_y)),
             "patch_bounds": [p_lat_min, p_lat_max, p_lon_min, p_lon_max],
+            # Per-patch cosine in the matched window — used by the client to
+            # render a "why did this match?" heatmap on the thumbnail.
+            "match_heatmap": (
+                best_cos_grid.astype(float).tolist() if best_cos_grid is not None else None
+            ),
         })
     out.sort(key=lambda d: d["similarity"], reverse=True)
 
@@ -1999,8 +2006,36 @@ function renderResults(results, scoreCol) {
     const score = r[scoreCol] ?? r.similarity ?? r.anomaly_score;
     const thumbUrl = r.patch_url || r.tile_url;
     const rotTag = r.match_rotation_deg ? ` <span style="color:#ffe600">↻${r.match_rotation_deg}°</span>` : "";
+
+    // Per-patch heatmap: green where this patch matched the query patch
+    // at the same relative position, red where it didn't. Encodes the
+    // "why did this match?" signal directly on the thumbnail.
+    function heatmapHTML(hm) {
+      if (!hm || !hm.length) return "";
+      const rows = hm.length, cols = hm[0].length;
+      const cells = [];
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          // Cosines on normalized DINO patches typically span ~0.4–1.0; map
+          // 0.5 → red, 0.85 → yellow, 1.0 → green.
+          const v = Math.max(0, Math.min(1, (hm[r][c] - 0.5) / 0.5));
+          const hue = Math.round(v * 120);  // 0 red, 120 green
+          cells.push(
+            `<div style="position:absolute;left:${c*100/cols}%;top:${r*100/rows}%;` +
+            `width:${100/cols}%;height:${100/rows}%;` +
+            `background:hsla(${hue},80%,50%,0.45);pointer-events:none"></div>`
+          );
+        }
+      }
+      return cells.join("");
+    }
     row.innerHTML = `
-      <img src="${thumbUrl}" loading="lazy" onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
+      <div style="position:relative;width:80px;height:80px;flex-shrink:0">
+        <img src="${thumbUrl}" loading="lazy"
+             style="width:100%;height:100%;object-fit:cover;border:1px solid #333;display:block"
+             onerror="this.onerror=null;this.style.opacity='.3';this.alt='•'"/>
+        ${heatmapHTML(r.match_heatmap)}
+      </div>
       <div class="meta">
         <div><b>#${idx + 1}</b>${rotTag}</div>
         <div>${scoreCol}: ${score?.toFixed(3)}</div>
@@ -2059,9 +2094,16 @@ function renderResults(results, scoreCol) {
       const previewUrl = r.patch_url || r.tile_url;
       document.getElementById("result-preview").innerHTML = `
         <h3>Result #${idx + 1} preview</h3>
-        <img src="${previewUrl}" style="width:100%;max-width:320px;border:1px solid #333"
-             onerror="this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'"/>
-        <p class="muted">z=${r.z} • tile (${r.x},${r.y}) • lat ${r.lat.toFixed(2)} lon ${r.lon.toFixed(2)} • ${scoreCol}: ${score?.toFixed(3)}</p>`;
+        <div style="position:relative;display:inline-block;max-width:320px">
+          <img src="${previewUrl}" style="display:block;width:100%;border:1px solid #333"
+               onerror="this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'"/>
+          ${heatmapHTML(r.match_heatmap)}
+        </div>
+        <p class="muted">
+          <span style="color:#0f0">■</span> high patch match ·
+          <span style="color:#ff0">■</span> medium ·
+          <span style="color:#f00">■</span> low<br>
+          z=${r.z} • tile (${r.x},${r.y}) • lat ${r.lat.toFixed(2)} lon ${r.lon.toFixed(2)} • ${scoreCol}: ${score?.toFixed(3)}</p>`;
     };
     el.appendChild(row);
   });
