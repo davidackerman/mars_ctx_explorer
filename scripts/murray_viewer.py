@@ -535,21 +535,44 @@ def _search_patches(
     fetch_z: int, search_zoom: int, top_k: int,
     spatial_diversity: bool = False, diversity_tiles: int = 4,
 ) -> list[dict]:
-    """Sub-tile retrieval. Crops the user's bbox, runs DINO patch tokens,
-    searches each query patch against the global patch index, merges hits
-    by (tile_row_id, patch_idx) keeping the max score across query patches.
+    """Sub-tile retrieval. Tries the chosen patch-index zoom first; if all
+    upstream tile fetches for the query bbox fail at that zoom, transparently
+    falls back to the next available patch-index zoom (e.g. z=10 → z=8) so
+    a temporary upstream gap at one zoom doesn't kill the query."""
+    patch_indices = APP_STATE.get("patch_indices", {})
+    if not patch_indices:
+        raise HTTPException(status_code=503, detail="Patch index not available.")
 
-    Returns a list of patch-level results with tile_url, tile_bounds, and
-    patch_bounds for drawing at patch resolution on the client."""
+    primary = search_zoom if search_zoom in patch_indices else max(patch_indices)
+    fallbacks = [primary] + sorted(
+        (z for z in patch_indices if z != primary), reverse=True
+    )
+
+    last_err: Optional[HTTPException] = None
+    for zoom_try in fallbacks:
+        try:
+            return _search_patches_at_zoom(
+                lat_min, lat_max, lon_min, lon_max,
+                top_k, zoom_try, patch_indices[zoom_try],
+                spatial_diversity=spatial_diversity,
+                diversity_tiles=diversity_tiles,
+            )
+        except HTTPException as e:
+            if e.status_code == 502:
+                logger.info("Patch search at z=%d failed (%s); falling back", zoom_try, e.detail)
+                last_err = e
+                continue
+            raise
+    raise last_err or HTTPException(status_code=502, detail="All patch-index zooms failed.")
+
+
+def _search_patches_at_zoom(
+    lat_min: float, lat_max: float, lon_min: float, lon_max: float,
+    top_k: int, search_zoom: int, state: dict,
+    spatial_diversity: bool = False, diversity_tiles: int = 4,
+) -> list[dict]:
     import faiss
 
-    patch_indices = APP_STATE.get("patch_indices", {})
-    state = patch_indices.get(search_zoom)
-    if state is None:
-        # Fall back to the finest available patch zoom.
-        if not patch_indices:
-            raise HTTPException(status_code=503, detail="Patch index not available.")
-        state = patch_indices[max(patch_indices)]
     tiles_df: pd.DataFrame = state["tiles_df"]
     patch_index = state["index"]
     grid_n = state["patch_grid_n"]
