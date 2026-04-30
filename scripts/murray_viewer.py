@@ -557,13 +557,46 @@ def _search_patches(
     z_i = state["zoom"]
     aspect_correct = bool(state["sidecar"].get("aspect_corrected", False))
 
-    # Embed the query at the SAME scale as the index. Instead of cropping
-    # the user's bbox and running DINO on a resized 224x224 crop (which gives
-    # a different embedding than what the index stored for those patches),
-    # we fetch every tile the bbox intersects, run DINO on the *whole tile*
-    # (same forward as the indexer did), and select only the patches that
-    # spatially fall inside the bbox. Those patches ARE the indexed vectors
-    # for this region — so self-match becomes exact.
+    # Snap the user's free-form bbox to the patch grid at search zoom z_i so
+    # the query template forms an integer rectangle the sliding window can
+    # score against directly. Cap to MAX_K×MAX_K tile cluster (preserve
+    # aspect ratio) so we don't fetch 49 tiles per candidate.
+    MAX_K = 3
+    patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
+    snap_pr0 = int(math.floor((90.0 - lat_max) / patch_deg))
+    snap_pr1 = int(math.ceil((90.0 - lat_min) / patch_deg)) - 1
+    snap_pc0 = int(math.floor((lon_min + 180.0) / patch_deg))
+    snap_pc1 = int(math.ceil((lon_max + 180.0) / patch_deg)) - 1
+    snap_pr0 = max(0, snap_pr0)
+    snap_pr1 = max(snap_pr0, snap_pr1)
+    snap_pc0 = max(0, snap_pc0)
+    snap_pc1 = max(snap_pc0, snap_pc1)
+    # Apply MAX_K cap — shrink the snapped rectangle toward its centre,
+    # preserving aspect ratio.
+    rows = snap_pr1 - snap_pr0 + 1
+    cols = snap_pc1 - snap_pc0 + 1
+    cap = MAX_K * grid_n
+    if rows > cap or cols > cap:
+        scale = min(cap / rows, cap / cols)
+        new_rows = max(1, int(round(rows * scale)))
+        new_cols = max(1, int(round(cols * scale)))
+        cr_mid = (snap_pr0 + snap_pr1) / 2
+        cc_mid = (snap_pc0 + snap_pc1) / 2
+        snap_pr0 = max(0, int(round(cr_mid - new_rows / 2)))
+        snap_pr1 = snap_pr0 + new_rows - 1
+        snap_pc0 = max(0, int(round(cc_mid - new_cols / 2)))
+        snap_pc1 = snap_pc0 + new_cols - 1
+    # Replace the input bbox with the snapped+capped one so DOWNSTREAM tile
+    # fetch and template construction use the same patch rectangle.
+    lat_max = 90.0 - snap_pr0 * patch_deg
+    lat_min = 90.0 - (snap_pr1 + 1) * patch_deg
+    lon_min = -180.0 + snap_pc0 * patch_deg
+    lon_max = -180.0 + (snap_pc1 + 1) * patch_deg
+
+    # Embed the query at the SAME scale as the index. Fetch every tile the
+    # snapped bbox intersects, run DINO on each whole tile (same forward as
+    # the indexer did), and pick the contiguous rectangle of patches that
+    # the snapped bbox covers. Self-match is now an identity.
     transform = APP_STATE["transform"]
     extractor = APP_STATE["extractor"]
 
@@ -600,67 +633,42 @@ def _search_patches(
     norms = np.linalg.norm(all_patches, axis=-1, keepdims=True)
     all_patches = all_patches / (norms + 1e-12)
 
-    # Collect the patches that geographically fall inside the user's bbox.
-    selected: list[np.ndarray] = []
+    # Build the query template as a contiguous (qry_rows, qry_cols, D) grid
+    # of patch vectors. Use the snapped global patch coordinates → tile-local
+    # coords. Since we already snapped lat/lon to the patch grid above, the
+    # template is exactly the integer rectangle the sliding window will score.
+    qry_patch_rows = max(1, snap_pr1 - snap_pr0 + 1)
+    qry_patch_cols = max(1, snap_pc1 - snap_pc0 + 1)
+    D = int(all_patches.shape[-1])
+    qtemplate = np.zeros((qry_patch_rows, qry_patch_cols, D), dtype="float32")
+    qmask = np.zeros((qry_patch_rows, qry_patch_cols), dtype=bool)
     for i, (tx, ty) in enumerate(ok_tiles):
-        t_lat_min, t_lat_max, t_lon_min, t_lon_max = tile_bounds_deg(z_i, tx, ty)
-        d_lat = (t_lat_max - t_lat_min) / grid_n
-        d_lon = (t_lon_max - t_lon_min) / grid_n
+        # Global patch indices spanned by this tile.
+        tile_pr0 = ty * grid_n
+        tile_pc0 = tx * grid_n
         for pr in range(grid_n):
-            p_lat_max = t_lat_max - pr * d_lat
-            p_lat_min = p_lat_max - d_lat
-            if p_lat_max <= lat_min or p_lat_min >= lat_max:
+            gpr = tile_pr0 + pr
+            if gpr < snap_pr0 or gpr > snap_pr1:
                 continue
             for pc in range(grid_n):
-                p_lon_min = t_lon_min + pc * d_lon
-                p_lon_max = p_lon_min + d_lon
-                if p_lon_max <= lon_min or p_lon_min >= lon_max:
+                gpc = tile_pc0 + pc
+                if gpc < snap_pc0 or gpc > snap_pc1:
                     continue
-                selected.append(all_patches[i, pr * grid_n + pc])
-    if not selected:
-        # Sub-patch bbox — snap to the one patch that contains its centre.
-        cx_lat = 0.5 * (lat_min + lat_max)
-        cx_lon = 0.5 * (lon_min + lon_max)
-        i = 0
-        tx, ty = ok_tiles[i]
-        t_lat_min, t_lat_max, t_lon_min, t_lon_max = tile_bounds_deg(z_i, tx, ty)
-        d_lat = (t_lat_max - t_lat_min) / grid_n
-        d_lon = (t_lon_max - t_lon_min) / grid_n
-        pr = int((t_lat_max - cx_lat) / d_lat)
-        pc = int((cx_lon - t_lon_min) / d_lon)
-        pr = max(0, min(grid_n - 1, pr))
-        pc = max(0, min(grid_n - 1, pc))
-        selected.append(all_patches[i, pr * grid_n + pc])
-    qvec = np.stack(selected, axis=0).astype("float32")  # (Qsel, D)
-    Q = qvec.shape[0]
-    D = qvec.shape[1]
+                qtemplate[gpr - snap_pr0, gpc - snap_pc0] = all_patches[i, pr * grid_n + pc]
+                qmask[gpr - snap_pr0, gpc - snap_pc0] = True
+    if not qmask.any():
+        raise HTTPException(status_code=502, detail="Query patches all came from failed tiles.")
+    # Mean vector for FAISS shortlist (still need to find candidate tiles).
+    qvec = qtemplate[qmask].astype("float32")  # (N, D), already normalized
+    Q = int(qvec.shape[0])
     faiss.normalize_L2(qvec)
 
-    # Query shape in patch grid units, NOT clipped to a single tile. If the
-    # query spans multiple tiles, we'll stitch a tile cluster around each
-    # FAISS candidate and slide the full-shape query window over the
-    # stitched grid. The cluster size cap below limits worst-case fetches.
-    patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
-    qry_patch_rows = max(1, int(round((lat_max - lat_min) / patch_deg)))
-    qry_patch_cols = max(1, int(round((lon_max - lon_min) / patch_deg)))
-    # k_y, k_x = how many tiles tall / wide the result rectangle spans.
+    # k_y, k_x = how many tiles tall / wide the cluster window must span to
+    # contain a query of (qry_patch_rows, qry_patch_cols).
     k_y = max(1, math.ceil(qry_patch_rows / grid_n))
     k_x = max(1, math.ceil(qry_patch_cols / grid_n))
-    # Hard cap so we don't fetch a 49-tile cluster per candidate.
-    MAX_K = 3
-    if k_y * k_x > MAX_K * MAX_K:
-        # Preserve aspect ratio while shrinking to fit the cap.
-        scale = math.sqrt((MAX_K * MAX_K) / (k_y * k_x))
-        new_rows = max(1, int(round(qry_patch_rows * scale)))
-        new_cols = max(1, int(round(qry_patch_cols * scale)))
-        qry_patch_rows, qry_patch_cols = new_rows, new_cols
-        k_y = max(1, math.ceil(qry_patch_rows / grid_n))
-        k_x = max(1, math.ceil(qry_patch_cols / grid_n))
-    cluster_rows = k_y * grid_n  # height of stitched patch grid
+    cluster_rows = k_y * grid_n
     cluster_cols = k_x * grid_n
-    # Final cap so qry doesn't exceed the cluster.
-    qry_patch_rows = min(qry_patch_rows, cluster_rows)
-    qry_patch_cols = min(qry_patch_cols, cluster_cols)
 
     # Mean-pooled query vector in unit-norm space — patch-aligned path,
     # gives self-match = 1.0.
@@ -805,24 +813,33 @@ def _search_patches(
                 stitched[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = g
                 valid_mask[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = True
 
+        # Spatial template matching: each query patch is dot-producted with
+        # the candidate patch at the same relative position inside the
+        # window, then averaged. Preserves the user's spatial arrangement
+        # (so a ridge intersection only matches another ridge intersection,
+        # not just any place with the same average texture).
         best_score = -2.0
         best_r0 = best_c0 = 0
         best_view = 0
+        # Pre-mask query template by valid query patches (qmask) so partial
+        # tile-fetch failures don't poison the score.
+        q_valid = qmask
+        n_qvalid = max(1, int(q_valid.sum()))
+        q_template = qtemplate  # (qry_rows, qry_cols, D), each row L2-normalised
         for r0 in range(cluster_rows - qry_patch_rows + 1):
             for c0 in range(cluster_cols - qry_patch_cols + 1):
-                # Skip windows that overlap any failed-fetch tile.
-                if not valid_mask[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols].all():
-                    continue
                 window = stitched[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
-                wmean = window.reshape(-1, D).mean(axis=0)
-                wmean = wmean / (np.linalg.norm(wmean) + 1e-12)
-                scores = qstack @ wmean
-                vbest = int(scores.argmax())
-                s = float(scores[vbest])
+                wvalid = valid_mask[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
+                joint = q_valid & wvalid
+                if joint.sum() < 0.7 * n_qvalid:
+                    continue  # too much of the window is over failed tiles
+                # Element-wise patch cosine; mean over valid positions.
+                cos_grid = (q_template * window).sum(axis=-1)  # (qry_rows, qry_cols)
+                s = float(cos_grid[joint].mean())
                 if s > best_score:
                     best_score = s
                     best_r0, best_c0 = r0, c0
-                    best_view = vbest
+                    best_view = 0
 
         if best_score < -1.5:
             continue  # all windows hit invalid tiles
