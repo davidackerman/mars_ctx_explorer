@@ -31,8 +31,7 @@ import pandas as pd
 import requests
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi import Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from PIL import Image
 from pydantic import BaseModel
@@ -81,6 +80,49 @@ def tile_bounds_deg(z: int, x: int, y: int) -> tuple[float, float, float, float]
 
 
 APP_STATE: dict = {}
+PREPROCESS_RESIZE_SQUARE = "resize_square"
+PREPROCESS_ASPECT_PAD_V1 = "aspect_preserve_pad_v1"
+
+
+def _state_preprocess(state: dict) -> str:
+    return str(state["sidecar"].get("preprocess", PREPROCESS_RESIZE_SQUARE))
+
+
+def _preprocess_preserves_aspect(preprocess: str) -> bool:
+    return preprocess == PREPROCESS_ASPECT_PAD_V1
+
+
+def _get_transform(preprocess: str, image_size: int):
+    transforms = APP_STATE.setdefault("transforms", {})
+    key = (preprocess, int(image_size))
+    if key not in transforms:
+        extractor_cls = APP_STATE["extractor_cls"]
+        transforms[key] = extractor_cls.get_default_transforms(
+            image_size=int(image_size),
+            preserve_aspect=_preprocess_preserves_aspect(preprocess),
+        )
+    return transforms[key]
+
+
+def _transform_for_state(state: dict):
+    return _get_transform(
+        _state_preprocess(state),
+        int(state["sidecar"].get("image_size", 224)),
+    )
+
+
+def _transform_for_zoom(zoom: int):
+    state = APP_STATE["indices"].get(zoom)
+    if state is None:
+        state = APP_STATE["indices"][APP_STATE["default_zoom"]]
+    return _transform_for_state(state)
+
+
+def _index_preprocess(zoom: int) -> str:
+    state = APP_STATE["indices"].get(zoom)
+    if state is None:
+        return PREPROCESS_RESIZE_SQUARE
+    return _state_preprocess(state)
 
 
 def _load_single_index(index_dir: Path) -> dict:
@@ -203,14 +245,14 @@ def _load(index_root: Path, patch_root: Optional[Path] = None) -> None:
     os.environ.setdefault("HF_HUB_CACHE", "/mnt/bigdisk/hf_cache/hub")
     from scientific_pipelines.core.embeddings import DINOv3HFExtractor
 
+    APP_STATE["extractor_cls"] = DINOv3HFExtractor
+    APP_STATE["transforms"] = {}
     APP_STATE["extractor"] = DINOv3HFExtractor(
         model_name=APP_STATE["sidecar"]["model_name"],
         device="cuda",
         use_half_precision=True,
     )
-    APP_STATE["transform"] = DINOv3HFExtractor.get_default_transforms(
-        image_size=APP_STATE["sidecar"].get("image_size", 224)
-    )
+    APP_STATE["transform"] = _transform_for_state(indices[default_zoom])
     APP_STATE["session"] = requests.Session()
     APP_STATE["session"].headers["User-Agent"] = (
         "mars-astrobio-viewer/0.1 (contact: ackermand@janelia.hhmi.org)"
@@ -328,14 +370,22 @@ def _fetch_tile_bytes(z: int, x: int, y: int, max_attempts: int = 6) -> bytes:
     raise HTTPException(status_code=502, detail=f"Tile fetch failed after retries: {last_status}")
 
 
-def _fetch_and_embed(z: int, x: int, y: int, aspect_correct: bool = False) -> np.ndarray:
+def _fetch_and_embed(
+    z: int,
+    x: int,
+    y: int,
+    aspect_correct: bool = False,
+    transform=None,
+) -> np.ndarray:
     import faiss
 
     content = _fetch_tile_bytes(z, x, y)
     img = Image.open(io.BytesIO(content)).convert("RGB")
     if aspect_correct:
         img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
-    tensor = APP_STATE["transform"](img).unsqueeze(0)
+    if transform is None:
+        transform = APP_STATE["transform"]
+    tensor = transform(img).unsqueeze(0)
     vec = APP_STATE["extractor"].extract(tensor).astype("float32")
     faiss.normalize_L2(vec)
     return vec
@@ -346,10 +396,14 @@ def _tile_range_for_bbox(
 ) -> tuple[int, int, int, int]:
     """Return (x_min, x_max, y_min, y_max) tile indices covering the bbox."""
     size = TILE_PX * pixel_size_deg(z)
-    x_min = max(0, int((lon_min + 180.0) / size))
-    x_max = min(2 * (2**z) - 1, int((lon_max + 180.0) / size))
-    y_min = max(0, int((90.0 - lat_max) / size))  # lat_max is north; y small
-    y_max = min(1 * (2**z) - 1, int((90.0 - lat_min) / size))
+    max_x = 2 * (2**z) - 1
+    max_y = 1 * (2**z) - 1
+    x_min = max(0, int(math.floor((lon_min + 180.0) / size)))
+    x_max = min(max_x, int(math.ceil((lon_max + 180.0) / size)) - 1)
+    y_min = max(0, int(math.floor((90.0 - lat_max) / size)))  # lat_max is north
+    y_max = min(max_y, int(math.ceil((90.0 - lat_min) / size)) - 1)
+    x_max = max(x_min, x_max)
+    y_max = max(y_min, y_max)
     return x_min, x_max, y_min, y_max
 
 
@@ -396,7 +450,6 @@ def _fetch_bbox_composite(
     if n_x <= 0 or n_y <= 0:
         raise HTTPException(status_code=400, detail="Empty bbox")
 
-    session: requests.Session = APP_STATE["session"]
     canvas = Image.new("RGB", (n_x * TILE_PX, n_y * TILE_PX), (0, 0, 0))
 
     def fetch_one(x: int, y: int) -> tuple[int, int, Optional[Image.Image]]:
@@ -433,12 +486,14 @@ def _fetch_bbox_composite(
     return canvas.crop((crop_x0, crop_y0, crop_x1, crop_y1))
 
 
-def _embed_pil(img: Image.Image) -> np.ndarray:
+def _embed_pil(img: Image.Image, transform=None) -> np.ndarray:
     import faiss
 
     if img.mode != "RGB":
         img = img.convert("RGB")
-    tensor = APP_STATE["transform"](img).unsqueeze(0)
+    if transform is None:
+        transform = APP_STATE["transform"]
+    tensor = transform(img).unsqueeze(0)
     vec = APP_STATE["extractor"].extract(tensor).astype("float32")
     faiss.normalize_L2(vec)
     return vec
@@ -459,6 +514,29 @@ def _patch_bounds_deg(
     return p_lat_min, p_lat_max, p_lon_min, p_lon_max
 
 
+def _candidate_cluster_anchors(
+    z: int,
+    candidate_x: int,
+    candidate_y: int,
+    k_x: int,
+    k_y: int,
+) -> list[tuple[int, int, int]]:
+    """All legal top-left tile anchors for a cluster containing a candidate tile."""
+    max_x = 2 * (2**z) - 1
+    max_y = 1 * (2**z) - 1
+    anchors: list[tuple[int, int, int]] = []
+    for off_y in range(k_y):
+        ay = candidate_y - off_y
+        if ay < 0 or ay > max_y - (k_y - 1):
+            continue
+        for off_x in range(k_x):
+            ax = candidate_x - off_x
+            if ax < 0 or ax > max_x - (k_x - 1):
+                continue
+            anchors.append((z, ax, ay))
+    return anchors
+
+
 def _rerank_patch_groups(
     qvec: np.ndarray, candidates: list[dict], grid_n: int, aspect_correct: bool,
 ) -> list[dict]:
@@ -467,8 +545,9 @@ def _rerank_patch_groups(
     patch grid in one DINO forward (batched across all unique tiles),
     mean-pool the patches INSIDE the candidate's patch bbox, and dot
     against the mean-pooled query vector."""
-    import faiss
     from concurrent.futures import ThreadPoolExecutor
+
+    import faiss
 
     if not candidates:
         return candidates
@@ -532,7 +611,7 @@ def _rerank_patch_groups(
 
 def _search_patches(
     lat_min: float, lat_max: float, lon_min: float, lon_max: float,
-    fetch_z: int, search_zoom: int, top_k: int,
+    search_zoom: int, top_k: int,
     spatial_diversity: bool = False, diversity_tiles: int = 4,
 ) -> list[dict]:
     """Sub-tile retrieval. Tries the chosen patch-index zoom first; if all
@@ -576,15 +655,15 @@ def _search_patches_at_zoom(
     tiles_df: pd.DataFrame = state["tiles_df"]
     patch_index = state["index"]
     grid_n = state["patch_grid_n"]
-    P = state["num_patches_per_tile"]
+    patches_per_tile = state["num_patches_per_tile"]
     z_i = state["zoom"]
     aspect_correct = bool(state["sidecar"].get("aspect_corrected", False))
 
     # Snap the user's free-form bbox to the patch grid at search zoom z_i so
     # the query template forms an integer rectangle the sliding window can
-    # score against directly. Cap to MAX_K×MAX_K tile cluster (preserve
+    # score against directly. Cap to max_k x max_k tile cluster (preserve
     # aspect ratio) so we don't fetch 49 tiles per candidate.
-    MAX_K = 3
+    max_k = 3
     patch_deg = pixel_size_deg(z_i) * TILE_PX / grid_n
     snap_pr0 = int(math.floor((90.0 - lat_max) / patch_deg))
     snap_pr1 = int(math.ceil((90.0 - lat_min) / patch_deg)) - 1
@@ -594,11 +673,11 @@ def _search_patches_at_zoom(
     snap_pr1 = max(snap_pr0, snap_pr1)
     snap_pc0 = max(0, snap_pc0)
     snap_pc1 = max(snap_pc0, snap_pc1)
-    # Apply MAX_K cap — shrink the snapped rectangle toward its centre,
+    # Apply max_k cap: shrink the snapped rectangle toward its centre,
     # preserving aspect ratio.
     rows = snap_pr1 - snap_pr0 + 1
     cols = snap_pc1 - snap_pc0 + 1
-    cap = MAX_K * grid_n
+    cap = max_k * grid_n
     if rows > cap or cols > cap:
         scale = min(cap / rows, cap / cols)
         new_rows = max(1, int(round(rows * scale)))
@@ -620,7 +699,7 @@ def _search_patches_at_zoom(
     # snapped bbox intersects, run DINO on each whole tile (same forward as
     # the indexer did), and pick the contiguous rectangle of patches that
     # the snapped bbox covers. Self-match is now an identity.
-    transform = APP_STATE["transform"]
+    transform = _transform_for_state(state)
     extractor = APP_STATE["extractor"]
 
     x0, x1, y0, y1 = _tile_range_for_bbox(z_i, lat_min, lat_max, lon_min, lon_max)
@@ -662,8 +741,8 @@ def _search_patches_at_zoom(
     # template is exactly the integer rectangle the sliding window will score.
     qry_patch_rows = max(1, snap_pr1 - snap_pr0 + 1)
     qry_patch_cols = max(1, snap_pc1 - snap_pc0 + 1)
-    D = int(all_patches.shape[-1])
-    qtemplate = np.zeros((qry_patch_rows, qry_patch_cols, D), dtype="float32")
+    dim = int(all_patches.shape[-1])
+    qtemplate = np.zeros((qry_patch_rows, qry_patch_cols, dim), dtype="float32")
     qmask = np.zeros((qry_patch_rows, qry_patch_cols), dtype=bool)
     for i, (tx, ty) in enumerate(ok_tiles):
         # Global patch indices spanned by this tile.
@@ -683,7 +762,7 @@ def _search_patches_at_zoom(
         raise HTTPException(status_code=502, detail="Query patches all came from failed tiles.")
     # Mean vector for FAISS shortlist (still need to find candidate tiles).
     qvec = qtemplate[qmask].astype("float32")  # (N, D), already normalized
-    Q = int(qvec.shape[0])
+    q_count = int(qvec.shape[0])
     faiss.normalize_L2(qvec)
 
     # k_y, k_x = how many tiles tall / wide the cluster window must span to
@@ -693,70 +772,18 @@ def _search_patches_at_zoom(
     cluster_rows = k_y * grid_n
     cluster_cols = k_x * grid_n
 
-    # Mean-pooled query vector in unit-norm space — patch-aligned path,
-    # gives self-match = 1.0.
-    qmean = qvec.mean(axis=0, keepdims=True).astype("float32")
-    faiss.normalize_L2(qmean)
-
-    # Rotation-invariant augmentation: also embed the bbox crop at 90, 180,
-    # 270 degrees so a candidate that matches the query when rotated still
-    # surfaces. We score each candidate window against ALL of these query
-    # vectors and take the max similarity. Self-match remains exact (qmean
-    # is preserved verbatim in the stack).
-    def _rotated_query_means() -> list[np.ndarray]:
-        try:
-            crop = _fetch_bbox_composite(fetch_z, lat_min, lat_max, lon_min, lon_max)
-            if _image_is_mostly_black(crop):
-                return []
-            if aspect_correct:
-                cl = 0.5 * (lat_min + lat_max)
-                cos_lat = max(0.05, math.cos(math.radians(abs(cl))))
-                if cos_lat < 0.999:
-                    new_w = max(32, int(round(crop.width * cos_lat)))
-                    crop = crop.resize((new_w, crop.height), Image.LANCZOS)
-        except Exception:
-            return []
-        means = []
-        for angle in (0, 90, 180, 270):
-            rot = crop.rotate(angle, expand=True, resample=Image.BICUBIC) if angle else crop
-            try:
-                t = transform(rot).unsqueeze(0)
-                p = extractor.extract_patches(t).astype("float32")  # (1, 196, D)
-                pn = np.linalg.norm(p, axis=-1, keepdims=True)
-                p = p / (pn + 1e-12)
-                m = p.reshape(-1, p.shape[-1]).mean(axis=0, keepdims=True).astype("float32")
-                faiss.normalize_L2(m)
-                means.append(m)
-            except Exception:
-                continue
-        return means
-
-    qmeans_aug = _rotated_query_means()
-    # Stack: patch-aligned (self-match anchor) + rotated crop-DINO views.
-    all_qmeans = [qmean] + qmeans_aug
-
-    # Step 1: shortlist candidate tiles via FAISS patch search. Search
-    # against ALL augmented query views so rotated matches make the
-    # shortlist (a rotated crater wouldn't surface for the patch-aligned
-    # query alone).
-    per_query_k = max(16, top_k * 4 // max(1, Q) + 8)
+    # Step 1: shortlist candidate tiles via FAISS patch search. Rotation
+    # invariance intentionally stays off here until the exact template scorer
+    # also has rotated DINO templates to rerank against.
+    per_query_k = max(16, top_k * 4 // max(1, q_count) + 8)
     candidate_trids: dict[int, float] = {}
     # Per-patch FAISS for the patch-aligned query
     _dist, _idx = patch_index.search(qvec, per_query_k)
-    for qi in range(Q):
-        for score, idx in zip(_dist[qi], _idx[qi]):
+    for qi in range(q_count):
+        for score, idx in zip(_dist[qi], _idx[qi], strict=False):
             if idx < 0:
                 continue
-            trid = int(idx // P)
-            if score > candidate_trids.get(trid, -1.0):
-                candidate_trids[trid] = float(score)
-    # Per-rotation mean-vector FAISS to surface rotated candidates
-    for m in qmeans_aug:
-        _d2, _i2 = patch_index.search(m.astype("float32"), per_query_k)
-        for score, idx in zip(_d2[0], _i2[0]):
-            if idx < 0:
-                continue
-            trid = int(idx // P)
+            trid = int(idx // patches_per_tile)
             if score > candidate_trids.get(trid, -1.0):
                 candidate_trids[trid] = float(score)
     shortlist = sorted(candidate_trids.items(), key=lambda kv: kv[1], reverse=True)[: top_k * 8]
@@ -765,24 +792,28 @@ def _search_patches_at_zoom(
     # window across the patch grid and score each window by exact mean cosine.
     from concurrent.futures import ThreadPoolExecutor
 
-    # Anchor each candidate at the top-left of a (k_y × k_x) tile cluster.
-    # Build the unique set of tiles to fetch (clusters overlap heavily).
+    # The FAISS hit can land in any tile covered by a multi-tile query window,
+    # not just the top-left tile. Try every legal cluster anchor that contains
+    # the candidate tile, then cap by shortlist score to bound rerank cost.
     tiles_to_fetch: dict[tuple[int, int, int], "torch.Tensor"] = {}
-    candidate_clusters: list[tuple[int, int, int]] = []  # anchor (z, x, y)
-    for trid, _ in shortlist:
+    cluster_scores: dict[tuple[int, int, int], float] = {}
+    for trid, score in shortlist:
         if trid >= len(tiles_df):
             continue
         row = tiles_df.iloc[trid]
         cz, cx, cy = int(row.z), int(row.x), int(row.y)
-        max_x = 2 * (2 ** cz) - 1
-        max_y = 1 * (2 ** cz) - 1
-        # Clamp the cluster top-left so we don't run off the right/bottom of
-        # the world.
-        ax = min(cx, max_x - (k_x - 1))
-        ay = min(cy, max_y - (k_y - 1))
-        ax = max(0, ax)
-        ay = max(0, ay)
-        candidate_clusters.append((cz, ax, ay))
+        for anchor in _candidate_cluster_anchors(cz, cx, cy, k_x, k_y):
+            if score > cluster_scores.get(anchor, -1.0):
+                cluster_scores[anchor] = float(score)
+
+    max_clusters = max(64, top_k * 8)
+    candidate_clusters = [
+        key
+        for key, _score in sorted(
+            cluster_scores.items(), key=lambda kv: kv[1], reverse=True
+        )[:max_clusters]
+    ]
+    for cz, ax, ay in candidate_clusters:
         for dy in range(k_y):
             for dx in range(k_x):
                 tiles_to_fetch[(cz, ax + dx, ay + dy)] = None
@@ -812,21 +843,19 @@ def _search_patches_at_zoom(
     cn = np.linalg.norm(cand_patches, axis=-1, keepdims=True)
     cand_patches = cand_patches / (cn + 1e-12)
     key_to_grid = {
-        k: cand_patches[i].reshape(grid_n, grid_n, D)
+        k: cand_patches[i].reshape(grid_n, grid_n, dim)
         for i, k in enumerate(keys_with_data)
     }
 
     out: list[dict] = []
     seen_clusters: set[tuple[int, int, int]] = set()
-    qstack = np.concatenate(all_qmeans, axis=0).astype("float32")  # (V, D)
-
     for cz, ax, ay in candidate_clusters:
         if (cz, ax, ay) in seen_clusters:
             continue
         seen_clusters.add((cz, ax, ay))
 
         # Stitch the (k_y × k_x) tiles into one (cluster_rows, cluster_cols, D) grid.
-        stitched = np.zeros((cluster_rows, cluster_cols, D), dtype="float32")
+        stitched = np.zeros((cluster_rows, cluster_cols, dim), dtype="float32")
         valid_mask = np.zeros((cluster_rows, cluster_cols), dtype=bool)
         for dy in range(k_y):
             for dx in range(k_x):
@@ -843,7 +872,6 @@ def _search_patches_at_zoom(
         # not just any place with the same average texture).
         best_score = -2.0
         best_r0 = best_c0 = 0
-        best_view = 0
         best_cos_grid: Optional[np.ndarray] = None
         # Pre-mask query template by valid query patches (qmask) so partial
         # tile-fetch failures don't poison the score.
@@ -863,7 +891,6 @@ def _search_patches_at_zoom(
                 if s > best_score:
                     best_score = s
                     best_r0, best_c0 = r0, c0
-                    best_view = 0
                     best_cos_grid = cos_grid.copy()
 
         if best_score < -1.5:
@@ -891,9 +918,6 @@ def _search_patches_at_zoom(
         p_lat_max = max(tl[1], br[1])
         p_lon_min = min(tl[2], br[2])
         p_lon_max = max(tl[3], br[3])
-        view_to_deg = {0: 0}
-        for vi in range(len(qmeans_aug)):
-            view_to_deg[1 + vi] = vi * 90
         # Thumbnail: when the result spans multiple tiles, just point at the
         # anchor tile crop (cropping a multi-tile composite would need a new
         # endpoint; fall back to a tile-relative crop for now).
@@ -910,7 +934,7 @@ def _search_patches_at_zoom(
             "lat": 0.5 * (p_lat_min + p_lat_max),
             "lon": 0.5 * (p_lon_min + p_lon_max),
             "similarity": best_score,
-            "match_rotation_deg": view_to_deg.get(best_view, 0),
+            "match_rotation_deg": 0,
             "tile_url": f"/api/tile_img?z={cz}&x={anchor_tile_x}&y={anchor_tile_y}",
             "patch_url": (
                 f"/api/tile_crop?z={cz}&x={anchor_tile_x}&y={anchor_tile_y}"
@@ -960,13 +984,14 @@ def _rerank_cls_candidates(
     cosine against the (already-normalized) query vector, and re-sorts. Since
     pq_bytes=64 compresses 1024-D to 64 bytes and bakes ~0.5 floor into all
     cosines, this is the only way to surface realistic similarity numbers."""
-    import faiss
     from concurrent.futures import ThreadPoolExecutor
+
+    import faiss
 
     if not candidates:
         return candidates
     aspect_correct = _index_is_aspect_corrected(zoom)
-    transform = APP_STATE["transform"]
+    transform = _transform_for_zoom(zoom)
     extractor = APP_STATE["extractor"]
 
     def load_tile(c: dict) -> Optional["torch.Tensor"]:
@@ -1045,7 +1070,7 @@ def _search(
     distances, indices = state["index"].search(vec, fetch_k)
     md: pd.DataFrame = state["metadata"]
     results = []
-    for dist, idx in zip(distances[0], indices[0]):
+    for dist, idx in zip(distances[0], indices[0], strict=False):
         if idx < 0:
             continue
         row = md.iloc[idx]
@@ -1140,7 +1165,10 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
 
     mode = (q.mode or "composite").lower()
     aspect_correct_query = _index_is_aspect_corrected(search_zoom)
-    import base64, faiss
+    query_transform = _transform_for_zoom(search_zoom)
+    import base64
+
+    import faiss
 
     if mode == "composite":
         # One forward pass over the entire composited region → one query
@@ -1164,7 +1192,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 region_img = region_img.resize(
                     (new_w, region_img.height), Image.LANCZOS
                 )
-        vec = _embed_pil(region_img)
+        vec = _embed_pil(region_img, transform=query_transform)
         results = _search(
             vec, q.top_k, zoom=search_zoom,
             spatial_diversity=q.spatial_diversity,
@@ -1188,7 +1216,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         fetch_z = used_fetch_z
         results = _search_patches(
             q.lat_min, q.lat_max, q.lon_min, q.lon_max,
-            fetch_z, search_zoom, q.top_k,
+            search_zoom, q.top_k,
             spatial_diversity=q.spatial_diversity,
             diversity_tiles=q.diversity_tiles,
         )
@@ -1212,7 +1240,11 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         for tx, ty in tiles_xy:
             try:
                 v = _fetch_and_embed(
-                    search_zoom, tx, ty, aspect_correct=aspect_correct_query
+                    search_zoom,
+                    tx,
+                    ty,
+                    aspect_correct=aspect_correct_query,
+                    transform=query_transform,
                 )
                 vecs.append(v[0])
             except HTTPException:
@@ -1286,7 +1318,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                              q_img_for_patches.height),
                             Image.LANCZOS,
                         )
-            q_tensor = APP_STATE["transform"](q_img_for_patches).unsqueeze(0)
+            q_tensor = query_transform(q_img_for_patches).unsqueeze(0)
             q_patches = APP_STATE["extractor"].extract_patches(q_tensor)[0]  # (P, D)
             q_patches /= np.clip(np.linalg.norm(q_patches, axis=1, keepdims=True), 1e-9, None)
             q_mean = q_patches.mean(axis=0)
@@ -1303,7 +1335,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                         tile_img = _apply_aspect_correction(
                             tile_img, tile_center_deg(r["z"], r["x"], r["y"])[0]
                         )
-                    t_tensor = APP_STATE["transform"](tile_img).unsqueeze(0)
+                    t_tensor = query_transform(tile_img).unsqueeze(0)
                     t_patches = APP_STATE["extractor"].extract_patches(t_tensor)[0]  # (P, D)
                     t_patches /= np.clip(
                         np.linalg.norm(t_patches, axis=1, keepdims=True), 1e-9, None
@@ -1350,6 +1382,7 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
                 "composite_h": preview_img.height,
                 "preview_b64": preview_b64,
                 "aspect_corrected": aspect_correct_query,
+                "preprocess": _index_preprocess(search_zoom),
             },
             "results": results,
         }
@@ -1368,7 +1401,13 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
     # the same feature space as the searched tiles.
     x, y = latlon_to_tile(q.lat, q.lon, index_zoom)
     aspect_correct = _index_is_aspect_corrected(index_zoom)
-    vec = _fetch_and_embed(index_zoom, x, y, aspect_correct=aspect_correct)
+    vec = _fetch_and_embed(
+        index_zoom,
+        x,
+        y,
+        aspect_correct=aspect_correct,
+        transform=_transform_for_zoom(index_zoom),
+    )
     results = _search(
         vec, q.top_k, zoom=index_zoom,
         spatial_diversity=q.spatial_diversity,
@@ -1383,6 +1422,7 @@ def api_query_latlon(q: LatLonQuery) -> JSONResponse:
                 "tile_bounds": list(tile_bounds_deg(index_zoom, x, y)),
                 "index_zoom_used": index_zoom,
                 "available_zooms": APP_STATE["available_zooms"],
+                "preprocess": _index_preprocess(index_zoom),
             },
             "results": results,
         }
@@ -1403,7 +1443,7 @@ def api_anomalies(k: int = 20) -> JSONResponse:
     index_dir: Path = APP_STATE["index_dir"]
     scores_path = index_dir / "anomaly_scores.parquet"
     if not scores_path.exists():
-        import faiss, time as _time
+        import faiss
 
         faiss_index = APP_STATE["index"]
         ntotal = faiss_index.ntotal
@@ -1414,28 +1454,28 @@ def api_anomalies(k: int = 20) -> JSONResponse:
         )
         # Read vectors back from the index (IVF-PQ reconstruction) in chunks to
         # avoid blowing RAM on very large indices.
-        K = 40  # neighbours
+        neighbour_k = 40
         chunk = 20_000
         all_scores = np.empty(ntotal, dtype=np.float32)
-        t0 = _time.time()
+        t0 = time.time()
         for start in range(0, ntotal, chunk):
             end = min(start + chunk, ntotal)
             vecs = np.empty((end - start, dim), dtype=np.float32)
             faiss_index.reconstruct_n(start, end - start, vecs)
             faiss.normalize_L2(vecs)
-            # K+1 because the closest neighbour to a vector is itself
-            dists, _ = faiss_index.search(vecs, K + 1)
+            # neighbour_k + 1 because the closest neighbour to a vector is itself
+            dists, _ = faiss_index.search(vecs, neighbour_k + 1)
             # Inner-product similarity → convert to distance (1 - sim), then
-            # take the median of the K real neighbours (exclude self at idx 0).
+            # average the real neighbours (exclude self at idx 0).
             sims = dists[:, 1:]
             neighbour_dist = 1.0 - sims.mean(axis=1)
             all_scores[start:end] = neighbour_dist.astype(np.float32)
             if (start // chunk) % 5 == 0:
-                logger.info("  %d/%d (%.0fs)", end, ntotal, _time.time() - t0)
+                logger.info("  %d/%d (%.0fs)", end, ntotal, time.time() - t0)
         md = APP_STATE["metadata"].copy()
         md["anomaly_score"] = all_scores
         md.to_parquet(scores_path, index=False)
-        logger.info("Wrote %s in %.0fs", scores_path, _time.time() - t0)
+        logger.info("Wrote %s in %.0fs", scores_path, time.time() - t0)
     df = pd.read_parquet(scores_path)
     s = df["anomaly_score"]
     # Clip to sane cosine-distance range only — IVF-PQ reconstruction of

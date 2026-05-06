@@ -33,11 +33,9 @@ import pandas as pd
 import requests
 import torch
 from PIL import Image
-from tqdm import tqdm
 
 # Share the tile-fetching + geometry utilities with the CLS indexer.
 from stream_murray_index import (
-    LEVEL0_RES_DEG,
     TILE_PX,
     TILE_URL,
     TileItem,
@@ -46,6 +44,7 @@ from stream_murray_index import (
     pixel_size_deg,
     tile_center_deg,
 )
+from tqdm import tqdm
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -88,7 +87,10 @@ def run(
     extractor = DINOv3HFExtractor(
         model_name=model_name, device="cuda", use_half_precision=True
     )
-    transform = DINOv3HFExtractor.get_default_transforms(image_size=image_size)
+    transform = DINOv3HFExtractor.get_default_transforms(
+        image_size=image_size,
+        preserve_aspect=True,
+    )
     dim = extractor.get_embedding_dim()
     # Probe num_patches_per_tile with a dummy forward
     probe = Image.new("RGB", (image_size, image_size), (0, 0, 0))
@@ -120,7 +122,7 @@ def run(
 
     subsets = [all_tiles[i::concurrency] for i in range(concurrency)]
     pool = ThreadPoolExecutor(max_workers=concurrency)
-    futures = [pool.submit(fetch_worker, s) for s in subsets]
+    _futures = [pool.submit(fetch_worker, s) for s in subsets]
 
     def _shutdown(*_):
         stop_flag.set()
@@ -158,9 +160,9 @@ def run(
             batch_tensors.append(transform(Image.fromarray(arr, mode="RGB")))
         batch = torch.stack(batch_tensors, dim=0)
         patches = extractor.extract_patches(batch).astype("float32")
-        # patches: (B, P, D) → flatten to (B*P, D)
-        B, P, D = patches.shape
-        patches_flat = patches.reshape(B * P, D)
+        # patches: (batch, patches, dim) -> flatten to (batch * patches, dim)
+        batch_count, patch_count, dim_count = patches.shape
+        patches_flat = patches.reshape(batch_count * patch_count, dim_count)
         faiss.normalize_L2(patches_flat)
 
         if not training_done:
@@ -174,9 +176,14 @@ def run(
                     pq_bytes,
                     train_mat.shape[0],
                 )
-                quantizer = faiss.IndexFlatIP(D)
+                quantizer = faiss.IndexFlatIP(dim_count)
                 index = faiss.IndexIVFPQ(
-                    quantizer, D, effective_nlist, pq_bytes, 8, faiss.METRIC_INNER_PRODUCT
+                    quantizer,
+                    dim_count,
+                    effective_nlist,
+                    pq_bytes,
+                    8,
+                    faiss.METRIC_INNER_PRODUCT,
                 )
                 index.train(train_mat)
                 for v in training_vectors:
@@ -255,6 +262,7 @@ def run(
         "nlist": effective_nlist if training_done else None,
         "tile_px": TILE_PX,
         "aspect_corrected": True,
+        "preprocess": "aspect_preserve_pad_v1",
         "num_patches_per_tile": num_patches_per_tile,
         "patch_grid_n": int(round(math.sqrt(num_patches_per_tile))),
         "kind": "patch",

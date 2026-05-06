@@ -44,7 +44,6 @@ import pandas as pd
 import requests
 import torch
 from PIL import Image
-from torchvision import transforms as T
 from tqdm import tqdm
 
 Image.MAX_IMAGE_PIXELS = None
@@ -98,10 +97,12 @@ def enumerate_tiles(
         y_range = range(total_y)
     else:
         lon_min, lat_min, lon_max, lat_max = bbox
-        x_min = max(0, int((lon_min + 180.0) / size))
-        x_max = min(total_x - 1, int((lon_max + 180.0) / size))
-        y_min = max(0, int((90.0 - lat_max) / size))  # remember y grows southward
-        y_max = min(total_y - 1, int((90.0 - lat_min) / size))
+        x_min = max(0, int(math.floor((lon_min + 180.0) / size)))
+        x_max = min(total_x - 1, int(math.ceil((lon_max + 180.0) / size)) - 1)
+        y_min = max(0, int(math.floor((90.0 - lat_max) / size)))  # y grows southward
+        y_max = min(total_y - 1, int(math.ceil((90.0 - lat_min) / size)) - 1)
+        x_max = max(x_min, x_max)
+        y_max = max(y_min, y_max)
         x_range = range(x_min, x_max + 1)
         y_range = range(y_min, y_max + 1)
     for y in y_range:
@@ -208,7 +209,10 @@ def run(
     from scientific_pipelines.core.embeddings import DINOv3HFExtractor
 
     extractor = DINOv3HFExtractor(model_name=model_name, device="cuda", use_half_precision=True)
-    transform = DINOv3HFExtractor.get_default_transforms(image_size=image_size)
+    transform = DINOv3HFExtractor.get_default_transforms(
+        image_size=image_size,
+        preserve_aspect=True,
+    )
     dim = extractor.get_embedding_dim()
     logger.info("Extractor ready: %s @ %d, dim=%d", model_name, image_size, dim)
 
@@ -231,7 +235,7 @@ def run(
     # Partition tiles across fetcher threads
     subsets = [all_tiles[i::concurrency] for i in range(concurrency)]
     pool = ThreadPoolExecutor(max_workers=concurrency)
-    futures = [pool.submit(fetch_worker, s) for s in subsets]
+    _futures = [pool.submit(fetch_worker, s) for s in subsets]
 
     def shutdown_handler(_sig, _frm):
         stop_flag.set()
@@ -298,7 +302,7 @@ def run(
             index.add(vectors)
 
         # Metadata (lat/lon via tile_center_deg)
-        for (z, x, y), vec in zip(pending_coords, vectors):
+        for z, x, y in pending_coords:
             lat, lon = tile_center_deg(z, x, y)
             metadata_rows.append(
                 {"row_id": total_ingested, "z": z, "x": x, "y": y, "lat": lat, "lon": lon}
@@ -359,6 +363,7 @@ def run(
         "nlist": effective_nlist if training_done else None,
         "tile_px": TILE_PX,
         "aspect_corrected": True,
+        "preprocess": "aspect_preserve_pad_v1",
     }
     import json
 

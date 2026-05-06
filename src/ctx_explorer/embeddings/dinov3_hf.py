@@ -91,14 +91,48 @@ class DINOv3HFExtractor(EmbeddingExtractor):
         return self._embedding_dim
 
     @staticmethod
-    def get_default_transforms(image_size: int = 512):
-        """Transforms compatible with DINOv3 ViT-16 (image_size multiple of 16)."""
-        from torchvision import transforms as T
+    def resize_preserve_aspect_and_pad(img, image_size: int):
+        """Resize an image to fit inside a square, preserving its aspect ratio."""
+        from PIL import Image
 
-        return T.Compose(
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Invalid image size: {img.size}")
+
+        scale = float(image_size) / float(max(w, h))
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        resample = getattr(Image, "Resampling", Image).BICUBIC
+        resized = img.resize((new_w, new_h), resample)
+
+        arr = np.asarray(resized)
+        if arr.ndim == 2:
+            fill = int(np.median(arr))
+        else:
+            fill = tuple(int(np.median(arr[..., c])) for c in range(arr.shape[-1]))
+
+        canvas = Image.new(resized.mode, (image_size, image_size), fill)
+        canvas.paste(resized, ((image_size - new_w) // 2, (image_size - new_h) // 2))
+        return canvas
+
+    @staticmethod
+    def get_default_transforms(image_size: int = 512, preserve_aspect: bool = False):
+        """Transforms compatible with DINOv3 ViT-16 (image_size multiple of 16)."""
+        from torchvision import transforms
+
+        resize = (
+            transforms.Lambda(
+                lambda img: DINOv3HFExtractor.resize_preserve_aspect_and_pad(
+                    img, image_size=image_size
+                )
+            )
+            if preserve_aspect
+            else transforms.Resize((image_size, image_size))
+        )
+        return transforms.Compose(
             [
-                T.Resize((image_size, image_size)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                resize,
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
