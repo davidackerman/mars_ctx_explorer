@@ -185,6 +185,7 @@ def run(
     train_sample: int = 20_000,
     pq_bytes: int = 64,
     nlist: Optional[int] = None,
+    shuffle_seed: int = 0,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -193,11 +194,18 @@ def run(
     all_tiles = list(enumerate_tiles(zoom, bbox))
     if max_tiles is not None:
         all_tiles = all_tiles[:max_tiles]
+    # Shuffle so the first vectors arriving at the trainer are sampled from
+    # all over Mars rather than the first row of latitudes only — without
+    # this the IVF k-means codebook is biased toward the polar band that
+    # row-major enumeration starts at.
+    import random as _random
+    _random.Random(shuffle_seed).shuffle(all_tiles)
     logger.info(
-        "Zoom %d: %d tiles (~%.1f km/side at equator)",
+        "Zoom %d: %d tiles (~%.1f km/side at equator), shuffled with seed=%d",
         zoom,
         len(all_tiles),
         TILE_PX * pixel_size_deg(zoom) * 59.3,
+        shuffle_seed,
     )
     if not all_tiles:
         logger.error("No tiles to process; check --zoom / --bbox")
@@ -248,7 +256,21 @@ def run(
     training_vectors: List[np.ndarray] = []
     training_done = False
     index: Optional[faiss.IndexIVFPQ] = None
-    effective_nlist = nlist or max(256, int(math.sqrt(len(all_tiles))))
+    if nlist is not None:
+        effective_nlist = nlist
+    else:
+        # Auto-cap so the trainer always has ≥40 vectors per centroid (FAISS
+        # warns at <30/centroid). Without this, sqrt(n) gave us 20k+
+        # centroids on the z10 patch index but only 200k training samples,
+        # leaving the codebook severely undertrained.
+        sqrt_nlist = max(256, int(math.sqrt(len(all_tiles))))
+        train_capped = max(256, train_sample // 40)
+        effective_nlist = min(sqrt_nlist, train_capped)
+        if effective_nlist < sqrt_nlist:
+            logger.info(
+                "Capping nlist %d -> %d so train_sample=%d is sufficient (>=40/centroid)",
+                sqrt_nlist, effective_nlist, train_sample,
+            )
 
     index_path = output_dir / "faiss.index"
     metadata_rows: List[dict] = []
@@ -312,6 +334,7 @@ def run(
         pending_images.clear()
         pending_coords.clear()
 
+    void_skipped = 0
     with tqdm(total=len(all_tiles), desc="Stream") as pbar:
         while alive_fetchers > 0 or not tile_queue.empty():
             item = tile_queue.get()
@@ -322,6 +345,15 @@ def run(
                 errors += 1
                 pbar.update(1)
                 continue
+            # Skip data-void tiles (mostly black) so they don't pollute the
+            # IVF codebook and inflate anomaly scores. Threshold: <15% of
+            # pixels brighter than 10/255.
+            arr = item.image
+            gray = arr if arr.ndim == 2 else arr.mean(axis=-1)
+            if (gray > 10).mean() < 0.15:
+                void_skipped += 1
+                pbar.update(1)
+                continue
             pending_images.append(item.image)
             pending_coords.append((item.z, item.x, item.y))
             pbar.update(1)
@@ -329,6 +361,7 @@ def run(
                 flush_batch()
         if pending_images:
             flush_batch()
+    logger.info("Skipped %d void tiles", void_skipped)
 
     if not training_done and training_vectors:
         # Not enough tiles to train IVF-PQ; fall back to a flat IP index
