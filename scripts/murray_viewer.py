@@ -159,6 +159,13 @@ def _load_patch_index(patch_dir: Path) -> dict:
     index = faiss.read_index(str(patch_dir / "patches.faiss"))
     if isinstance(index, faiss.IndexIVF):
         index.nprobe = 64
+        # Enable reconstruct(idx) so the "fast" score_mode can pull PQ-decoded
+        # patches straight from the index without re-fetching + re-DINO'ing
+        # candidate tiles. One-time cost during load; tiny memory overhead.
+        try:
+            index.make_direct_map()
+        except Exception as exc:
+            logger.warning("make_direct_map failed on %s: %s", patch_dir, exc)
         logger.info(
             "Set nprobe=64 on patch IVF index at %s (nlist=%d)",
             patch_dir, index.nlist,
@@ -257,6 +264,13 @@ def _load(index_root: Path, patch_root: Optional[Path] = None) -> None:
     APP_STATE["session"].headers["User-Agent"] = (
         "mars-astrobio-viewer/0.1 (contact: ackermand@janelia.hhmi.org)"
     )
+    # Default pool size is 10 — we send >30 concurrent fetches at a time, so
+    # the pool was being drained and connections discarded mid-query. Bump
+    # both the pool count and per-pool maxsize.
+    from requests.adapters import HTTPAdapter
+    _adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+    APP_STATE["session"].mount("https://", _adapter)
+    APP_STATE["session"].mount("http://", _adapter)
 
 
 def _select_index_for_bbox(lat_min: float, lat_max: float, lon_min: float, lon_max: float) -> int:
@@ -544,51 +558,49 @@ def _score_template_torch(
     valid_mask: np.ndarray,
     min_valid_ratio: float = 0.7,
 ) -> Optional[tuple[int, int, float, np.ndarray]]:
-    """GPU-vectorised replacement for the per-window-position Python loop
-    in the sliding template match. Two torch.conv2d ops do all the work:
+    """Vectorised sliding-template match against a stitched candidate grid.
 
-    1. cross-correlation of the (template * template_mask) kernel against
-       the stitched patch grid gives, at each output cell, the sum of
-       element-wise patch dot products for that window position.
-    2. cross-correlation of (template_mask) against valid_mask gives, at
-       each output cell, how many template+window cells are jointly valid.
+    Trick: instead of iterating over every window position and doing one
+    (t_h, t_w, D) element-wise multiply per position (slow Python loop),
+    iterate over template positions and do one numpy matmul per template
+    cell — the matmul is over (out_h * out_w, D) at a time, which BLAS
+    crushes. Far fewer template cells than window positions, and each
+    matmul is dense, contiguous, and BLAS-friendly.
 
-    Dividing (1) by (2) is the mean per-patch cosine for each window
-    position; argmax picks the winner. Then the cos_grid at the winning
-    window is computed in numpy for the heatmap.
+    Returns (best_r0, best_c0, best_score, cos_grid_at_best) or None.
     """
-    t_h, t_w, dim = template.shape
+    t_h, t_w, _ = template.shape
     cluster_h, cluster_w = stitched.shape[:2]
     out_h = cluster_h - t_h + 1
     out_w = cluster_w - t_w + 1
     if out_h <= 0 or out_w <= 0:
         return None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tpl_t = torch.from_numpy(template).to(device)
-    st_t = torch.from_numpy(stitched).to(device)
-    tm = torch.from_numpy(template_mask.astype("float32")).to(device)
-    vm = torch.from_numpy(valid_mask.astype("float32")).to(device)
+    # Zero out template cells that came from failed tiles so they
+    # contribute nothing to the per-position sum.
+    tpl_masked = template * template_mask[..., None].astype(template.dtype)
 
-    tpl_masked = tpl_t * tm.unsqueeze(-1)
-    kernel = tpl_masked.permute(2, 0, 1).unsqueeze(0).contiguous()  # (1, D, t_h, t_w)
-    inp = st_t.permute(2, 0, 1).unsqueeze(0).contiguous()           # (1, D, cluster_h, cluster_w)
-    with torch.inference_mode():
-        sum_per_pos = torch.nn.functional.conv2d(inp, kernel).squeeze(0).squeeze(0)
-        joint_counts = torch.nn.functional.conv2d(
-            vm.unsqueeze(0).unsqueeze(0),
-            tm.unsqueeze(0).unsqueeze(0),
-        ).squeeze(0).squeeze(0)
+    sum_per_pos = np.zeros((out_h, out_w), dtype="float32")
+    valid_counts = np.zeros((out_h, out_w), dtype="int32")
+    vm_int = valid_mask.astype("int32")
+    for i in range(t_h):
+        for j in range(t_w):
+            if not template_mask[i, j]:
+                continue
+            # stitched[i:i+out_h, j:j+out_w, :] @ template[i, j, :]
+            # → (out_h, out_w) dot-product accumulator.
+            sum_per_pos += stitched[i:i + out_h, j:j + out_w, :] @ tpl_masked[i, j, :]
+            valid_counts += vm_int[i:i + out_h, j:j + out_w]
 
-    n_tvalid = float(tm.sum())
+    n_tvalid = max(1, int(template_mask.sum()))
     threshold = min_valid_ratio * n_tvalid
-    means = sum_per_pos / torch.clamp(joint_counts, min=1.0)
-    means = torch.where(joint_counts >= threshold, means, torch.full_like(means, -2.0))
+    means = sum_per_pos / np.maximum(valid_counts, 1).astype("float32")
+    means = np.where(valid_counts >= threshold, means, np.full_like(means, -2.0))
 
     flat = int(means.argmax())
     best_r0 = flat // out_w
     best_c0 = flat % out_w
-    best_score = float(means.view(-1)[flat])
+    best_score = float(means.flat[flat])
     if best_score < -1.0:
         return None
 
@@ -635,7 +647,7 @@ def _rerank_patch_groups(
         except Exception:
             return k, None
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=32) as pool:
         results = list(pool.map(load, unique.keys()))
 
     keys = [k for k, t in results if t is not None]
@@ -673,6 +685,7 @@ def _search_patches(
     lat_min: float, lat_max: float, lon_min: float, lon_max: float,
     search_zoom: int, top_k: int,
     spatial_diversity: bool = False, diversity_tiles: int = 4,
+    score_mode: str = "exact",
 ) -> list[dict]:
     """Sub-tile retrieval. Tries the chosen patch-index zoom first; if all
     upstream tile fetches for the query bbox fail at that zoom, transparently
@@ -695,6 +708,7 @@ def _search_patches(
                 top_k, zoom_try, patch_indices[zoom_try],
                 spatial_diversity=spatial_diversity,
                 diversity_tiles=diversity_tiles,
+                score_mode=score_mode,
             )
         except HTTPException as e:
             if e.status_code == 502:
@@ -709,8 +723,13 @@ def _search_patches_at_zoom(
     lat_min: float, lat_max: float, lon_min: float, lon_max: float,
     top_k: int, search_zoom: int, state: dict,
     spatial_diversity: bool = False, diversity_tiles: int = 4,
+    score_mode: str = "exact",
 ) -> list[dict]:
     import faiss
+
+    _t0 = time.time()
+    def _tlog(stage: str) -> None:
+        logger.info("patch-search [%s] +%.2fs", stage, time.time() - _t0)
 
     tiles_df: pd.DataFrame = state["tiles_df"]
     patch_index = state["index"]
@@ -825,6 +844,7 @@ def _search_patches_at_zoom(
                 qmask[gpr - snap_pr0, gpc - snap_pc0] = True
     if not qmask.any():
         raise HTTPException(status_code=502, detail="Query patches all came from failed tiles.")
+    _tlog("query_dino_done")
     # Mean vector for FAISS shortlist (still need to find candidate tiles).
     qvec = qtemplate[qmask].astype("float32")  # (N, D), already normalized
     q_count = int(qvec.shape[0])
@@ -845,11 +865,43 @@ def _search_patches_at_zoom(
     # Step 1: shortlist candidate tiles via FAISS patch search. Rotation
     # invariance intentionally stays off here until the exact template scorer
     # also has rotated DINO templates to rerank against.
+    # Down-sample query patches for the shortlist: searching all 325 patches
+    # of a large query against 127M codes is ~5s. Mean-pool each ~3x3 tile
+    # of query patches into one centroid, giving ~36 representative
+    # queries instead of 325. Recall hit is minimal because the centroids
+    # cover the same feature space and the sliding-window rerank below
+    # uses the full template anyway.
+    query_max = 64
     per_query_k = max(16, top_k * 4 // max(1, q_count) + 8)
+    if q_count <= query_max:
+        qvec_search = qvec
+    else:
+        block = max(1, int(math.ceil(math.sqrt(q_count / query_max))))
+        # Reshape template back to 2D, block-average over (block, block) tiles.
+        tpl_block = qtemplate.reshape(qry_patch_rows, qry_patch_cols, -1)
+        block_rows = math.ceil(qry_patch_rows / block)
+        block_cols = math.ceil(qry_patch_cols / block)
+        centroids = np.zeros((block_rows * block_cols, tpl_block.shape[-1]), dtype="float32")
+        keep = []
+        for br in range(block_rows):
+            for bc in range(block_cols):
+                r0 = br * block
+                r1 = min(qry_patch_rows, r0 + block)
+                c0 = bc * block
+                c1 = min(qry_patch_cols, c0 + block)
+                block_patches = tpl_block[r0:r1, c0:c1]
+                block_mask = qmask[r0:r1, c0:c1]
+                if not block_mask.any():
+                    continue
+                centroids[len(keep)] = block_patches[block_mask].mean(axis=0)
+                keep.append(len(keep))
+        qvec_search = centroids[:len(keep)]
+        faiss.normalize_L2(qvec_search)
+    q_search_count = int(qvec_search.shape[0])
     candidate_trids: dict[int, float] = {}
-    # Per-patch FAISS for the patch-aligned query
-    _dist, _idx = patch_index.search(qvec, per_query_k)
-    for qi in range(q_count):
+    _dist, _idx = patch_index.search(qvec_search, per_query_k)
+    _tlog(f"faiss_shortlist_done n_query_vecs={q_search_count}")
+    for qi in range(q_search_count):
         for score, idx in zip(_dist[qi], _idx[qi], strict=False):
             if idx < 0:
                 continue
@@ -862,9 +914,13 @@ def _search_patches_at_zoom(
     # window across the patch grid and score each window by exact mean cosine.
     from concurrent.futures import ThreadPoolExecutor
 
-    # The FAISS hit can land in any tile covered by a multi-tile query window,
-    # not just the top-left tile. Try every legal cluster anchor that contains
-    # the candidate tile, then cap by shortlist score to bound rerank cost.
+    # Place each FAISS-hit tile near the centre of its cluster. For a self-
+    # match the hit IS the centre of the matched window, so a centred anchor
+    # always contains the right window; for off-centre matches, adjacent
+    # FAISS hits in the same neighbourhood produce overlapping clusters that
+    # cover the edge cases. Trying every k_x*k_y placement (the previous
+    # behaviour) was correct but ~6× too expensive — it forced fetching and
+    # DINO-embedding 5-10× more tiles than needed.
     tiles_to_fetch: dict[tuple[int, int, int], "torch.Tensor"] = {}
     cluster_scores: dict[tuple[int, int, int], float] = {}
     for trid, score in shortlist:
@@ -872,9 +928,13 @@ def _search_patches_at_zoom(
             continue
         row = tiles_df.iloc[trid]
         cz, cx, cy = int(row.z), int(row.x), int(row.y)
-        for anchor in _candidate_cluster_anchors(cz, cx, cy, k_x, k_y):
-            if score > cluster_scores.get(anchor, -1.0):
-                cluster_scores[anchor] = float(score)
+        max_x = 2 * (2 ** cz) - 1
+        max_y = 1 * (2 ** cz) - 1
+        ax = max(0, min(max_x - (k_x - 1), cx - k_x // 2))
+        ay = max(0, min(max_y - (k_y - 1), cy - k_y // 2))
+        anchor = (cz, ax, ay)
+        if score > cluster_scores.get(anchor, -1.0):
+            cluster_scores[anchor] = float(score)
 
     max_clusters = max(64, top_k * 8)
     candidate_clusters = [
@@ -888,35 +948,69 @@ def _search_patches_at_zoom(
             for dx in range(k_x):
                 tiles_to_fetch[(cz, ax + dx, ay + dy)] = None
 
-    def load(key):
-        z, x, y = key
-        try:
-            raw = _fetch_tile_bytes(z, x, y, max_attempts=3)
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
-            if _image_is_mostly_black(img, min_valid=0.05):
+    # tile (z, x, y) -> tile_row_id, for the fast path's PQ reconstruct.
+    # tiles_df is indexed by row position; build a (z, x, y) -> row dict for
+    # O(1) lookup. Cached on the state dict so it's built once per process.
+    tile_id_lookup = state.get("_tile_id_lookup")
+    if tile_id_lookup is None:
+        tile_id_lookup = {
+            (int(r.z), int(r.x), int(r.y)): i
+            for i, r in tiles_df.iterrows()
+        }
+        state["_tile_id_lookup"] = tile_id_lookup
+
+    key_to_grid: dict[tuple[int, int, int], np.ndarray] = {}
+    if score_mode == "fast":
+        # Pull PQ-decoded patches straight from the index. No tile fetch, no
+        # DINO. Loses ~5% to PQ quantisation; self-match drops to ~0.95.
+        for k in tiles_to_fetch.keys():
+            trid = tile_id_lookup.get(k)
+            if trid is None:
+                continue
+            try:
+                vecs = patch_index.reconstruct_n(
+                    trid * patches_per_tile, patches_per_tile
+                )
+            except Exception:
+                continue
+            vecs = vecs.astype("float32")
+            n = np.linalg.norm(vecs, axis=-1, keepdims=True)
+            vecs = vecs / (n + 1e-12)
+            key_to_grid[k] = vecs.reshape(grid_n, grid_n, -1)
+        _tlog(f"candidates_pq_decoded n={len(key_to_grid)}")
+    else:
+        # Exact path: re-fetch + re-DINO each candidate tile so cosine scores
+        # are computed against fresh embeddings (self-match = 1.000).
+        def load(key):
+            z, x, y = key
+            try:
+                raw = _fetch_tile_bytes(z, x, y, max_attempts=3)
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                if _image_is_mostly_black(img, min_valid=0.05):
+                    return key, None
+                if aspect_correct:
+                    img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
+                return key, transform(img)
+            except Exception:
                 return key, None
-            if aspect_correct:
-                img = _apply_aspect_correction(img, tile_center_deg(z, x, y)[0])
-            return key, transform(img)
-        except Exception:
-            return key, None
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        for key, t in pool.map(load, list(tiles_to_fetch.keys())):
-            tiles_to_fetch[key] = t
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            for key, t in pool.map(load, list(tiles_to_fetch.keys())):
+                tiles_to_fetch[key] = t
 
-    keys_with_data = [k for k, v in tiles_to_fetch.items() if v is not None]
-    if not keys_with_data:
-        return []
-    big_batch = torch.stack([tiles_to_fetch[k] for k in keys_with_data], dim=0)
-    cand_patches = extractor.extract_patches(big_batch).astype("float32")  # (B, P, D)
-    cn = np.linalg.norm(cand_patches, axis=-1, keepdims=True)
-    cand_patches = cand_patches / (cn + 1e-12)
-    key_to_grid = {
-        k: cand_patches[i].reshape(grid_n, grid_n, dim)
-        for i, k in enumerate(keys_with_data)
-    }
-
+        keys_with_data = [k for k, v in tiles_to_fetch.items() if v is not None]
+        if not keys_with_data:
+            return []
+        _tlog(f"tiles_fetched n={len(keys_with_data)}")
+        big_batch = torch.stack([tiles_to_fetch[k] for k in keys_with_data], dim=0)
+        cand_patches = extractor.extract_patches(big_batch).astype("float32")  # (B, P, D)
+        cn = np.linalg.norm(cand_patches, axis=-1, keepdims=True)
+        cand_patches = cand_patches / (cn + 1e-12)
+        key_to_grid = {
+            k: cand_patches[i].reshape(grid_n, grid_n, dim)
+            for i, k in enumerate(keys_with_data)
+        }
+        _tlog(f"candidates_dino_done clusters={len(candidate_clusters)}")
     out: list[dict] = []
     seen_clusters: set[tuple[int, int, int]] = set()
     for cz, ax, ay in candidate_clusters:
@@ -1056,7 +1150,7 @@ def _rerank_cls_candidates(
         except Exception:
             return None
 
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    with ThreadPoolExecutor(max_workers=32) as pool:
         tensors = list(pool.map(load_tile, candidates))
 
     kept_idx = [i for i, t in enumerate(tensors) if t is not None]
@@ -1169,6 +1263,11 @@ class BboxQuery(BaseModel):
     spatial_diversity: bool = False
     diversity_tiles: int = 4
     rerank: bool = True
+    # patch-mode only: "exact" re-fetches and re-DINO's every candidate tile
+    # for cosine-perfect scores (~8 s per query); "fast" reads PQ-decoded
+    # patch vectors straight from the index (~1-2 s per query, scores have
+    # ~5% PQ quantisation noise so self-match becomes ~0.95 instead of 1.0).
+    score_mode: str = "exact"
 
 
 @app.post("/api/query_bbox")
@@ -1250,23 +1349,28 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         preview_img = region_img.copy()
     elif mode == "patch":
         # True sub-tile retrieval against the pre-built global patch index.
-        # Every patch of every tile is a candidate.
-        preview_img, used_fetch_z = _fetch_bbox_with_fallback(
-            fetch_z, q.lat_min, q.lat_max, q.lon_min, q.lon_max
+        # The composite is only used for the preview thumbnail — patch
+        # matching itself works directly off whole-tile DINO outputs in
+        # _search_patches. Fetch the preview at search_zoom (a zoom whose
+        # tiles we actually have cached from the index build) instead of
+        # the auto-bumped fetch_z; the bump targets a zoom whose tiles
+        # nobody on this server has ever seen and each request was hitting
+        # upstream cold for ~8 z=11 tiles + a fallback walk back to z=10.
+        preview_img = _fetch_bbox_composite(
+            search_zoom, q.lat_min, q.lat_max, q.lon_min, q.lon_max
         )
         if _image_is_mostly_black(preview_img):
             raise HTTPException(
                 status_code=502,
-                detail="Query region is empty at every available zoom — upstream tile server is failing. Retry in a moment.",
+                detail="Query region is empty — upstream tile server is failing. Retry in a moment.",
             )
-        if used_fetch_z != fetch_z:
-            logger.info("Patch composite fell back from z=%d to z=%d", fetch_z, used_fetch_z)
-        fetch_z = used_fetch_z
+        fetch_z = search_zoom
         results = _search_patches(
             q.lat_min, q.lat_max, q.lon_min, q.lon_max,
             search_zoom, q.top_k,
             spatial_diversity=q.spatial_diversity,
             diversity_tiles=q.diversity_tiles,
+            score_mode=q.score_mode,
         )
     else:
         # Fetch each intersecting tile at the SEARCH zoom (not the fetch
@@ -1895,6 +1999,12 @@ GLOBE_HTML = r"""<!doctype html>
         <input type="checkbox" id="region-localize"/>
         Localize within each result tile (+3-10 s)
       </label>
+      <label class="muted" style="display:block;margin-top:4px">
+        <input type="checkbox" id="score-mode-fast"/>
+        ⚡ Fast scoring (PQ-decode from index; experimental — currently
+        SLOWER than exact due to per-call reconstruct overhead, but kept
+        wired so the comparison is visible)
+      </label>
     </fieldset>
     <p class="muted"><a href="/">← back to 2D viewer</a></p>
     <div id="query"></div>
@@ -2381,6 +2491,7 @@ async function runStagedRegion() {
   const localize = document.getElementById("region-localize").checked;
   const diversity = document.getElementById("spatial-diversity").checked;
   const diversityTiles = parseInt(document.getElementById("diversity-tiles").value) || 4;
+  const scoreMode = document.getElementById("score-mode-fast").checked ? "fast" : "exact";
   try {
     const resp = await fetch("/api/query_bbox", {
       method: "POST",
@@ -2391,6 +2502,7 @@ async function runStagedRegion() {
         top_k: 20, mode: queryMode, localize: localize,
         spatial_diversity: diversity,
         diversity_tiles: diversityTiles,
+        score_mode: scoreMode,
       }),
     });
     if (!resp.ok) {
