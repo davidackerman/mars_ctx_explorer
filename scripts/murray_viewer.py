@@ -675,9 +675,14 @@ def _search_patches_at_zoom(
     snap_pc1 = max(snap_pc0, snap_pc1)
     # Apply max_k cap: shrink the snapped rectangle toward its centre,
     # preserving aspect ratio.
+    # The cluster of max_k×max_k tiles has max_k*grid_n patches/side, but a
+    # window of W patches with starting offset (grid_n - 1) needs
+    # W + (grid_n - 1) total patches to fit. So the largest usable W is
+    # max_k*grid_n - (grid_n - 1). Capping qry to a smaller value here
+    # guarantees the cluster math below can always position the window.
     rows = snap_pr1 - snap_pr0 + 1
     cols = snap_pc1 - snap_pc0 + 1
-    cap = max_k * grid_n
+    cap = max_k * grid_n - (grid_n - 1)
     if rows > cap or cols > cap:
         scale = min(cap / rows, cap / cols)
         new_rows = max(1, int(round(rows * scale)))
@@ -766,9 +771,14 @@ def _search_patches_at_zoom(
     faiss.normalize_L2(qvec)
 
     # k_y, k_x = how many tiles tall / wide the cluster window must span to
-    # contain a query of (qry_patch_rows, qry_patch_cols).
-    k_y = max(1, math.ceil(qry_patch_rows / grid_n))
-    k_x = max(1, math.ceil(qry_patch_cols / grid_n))
+    # contain a query of (qry_patch_rows, qry_patch_cols). The query can
+    # start at any patch offset within its tile, so worst case the cluster
+    # needs to fit qry + (grid_n - 1) patches. Without the offset term, a
+    # 25-wide query whose left edge sits 12 patches into its tile needs 3
+    # tiles, not the 2 a naive ceil(25/14) would give — and no anchor can
+    # position the self-match window inside a too-small cluster.
+    k_y = max(1, math.ceil((qry_patch_rows + grid_n - 1) / grid_n))
+    k_x = max(1, math.ceil((qry_patch_cols + grid_n - 1) / grid_n))
     cluster_rows = k_y * grid_n
     cluster_cols = k_x * grid_n
 
