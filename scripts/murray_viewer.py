@@ -537,6 +537,66 @@ def _candidate_cluster_anchors(
     return anchors
 
 
+def _score_template_torch(
+    template: np.ndarray,
+    template_mask: np.ndarray,
+    stitched: np.ndarray,
+    valid_mask: np.ndarray,
+    min_valid_ratio: float = 0.7,
+) -> Optional[tuple[int, int, float, np.ndarray]]:
+    """GPU-vectorised replacement for the per-window-position Python loop
+    in the sliding template match. Two torch.conv2d ops do all the work:
+
+    1. cross-correlation of the (template * template_mask) kernel against
+       the stitched patch grid gives, at each output cell, the sum of
+       element-wise patch dot products for that window position.
+    2. cross-correlation of (template_mask) against valid_mask gives, at
+       each output cell, how many template+window cells are jointly valid.
+
+    Dividing (1) by (2) is the mean per-patch cosine for each window
+    position; argmax picks the winner. Then the cos_grid at the winning
+    window is computed in numpy for the heatmap.
+    """
+    t_h, t_w, dim = template.shape
+    cluster_h, cluster_w = stitched.shape[:2]
+    out_h = cluster_h - t_h + 1
+    out_w = cluster_w - t_w + 1
+    if out_h <= 0 or out_w <= 0:
+        return None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tpl_t = torch.from_numpy(template).to(device)
+    st_t = torch.from_numpy(stitched).to(device)
+    tm = torch.from_numpy(template_mask.astype("float32")).to(device)
+    vm = torch.from_numpy(valid_mask.astype("float32")).to(device)
+
+    tpl_masked = tpl_t * tm.unsqueeze(-1)
+    kernel = tpl_masked.permute(2, 0, 1).unsqueeze(0).contiguous()  # (1, D, t_h, t_w)
+    inp = st_t.permute(2, 0, 1).unsqueeze(0).contiguous()           # (1, D, cluster_h, cluster_w)
+    with torch.inference_mode():
+        sum_per_pos = torch.nn.functional.conv2d(inp, kernel).squeeze(0).squeeze(0)
+        joint_counts = torch.nn.functional.conv2d(
+            vm.unsqueeze(0).unsqueeze(0),
+            tm.unsqueeze(0).unsqueeze(0),
+        ).squeeze(0).squeeze(0)
+
+    n_tvalid = float(tm.sum())
+    threshold = min_valid_ratio * n_tvalid
+    means = sum_per_pos / torch.clamp(joint_counts, min=1.0)
+    means = torch.where(joint_counts >= threshold, means, torch.full_like(means, -2.0))
+
+    flat = int(means.argmax())
+    best_r0 = flat // out_w
+    best_c0 = flat % out_w
+    best_score = float(means.view(-1)[flat])
+    if best_score < -1.0:
+        return None
+
+    window = stitched[best_r0:best_r0 + t_h, best_c0:best_c0 + t_w]
+    cos_grid = (template * window).sum(axis=-1).astype("float32")
+    return best_r0, best_c0, best_score, cos_grid
+
+
 def _rerank_patch_groups(
     qvec: np.ndarray, candidates: list[dict], grid_n: int, aspect_correct: bool,
 ) -> list[dict]:
@@ -875,36 +935,14 @@ def _search_patches_at_zoom(
                 stitched[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = g
                 valid_mask[dy * grid_n:(dy + 1) * grid_n, dx * grid_n:(dx + 1) * grid_n] = True
 
-        # Spatial template matching: each query patch is dot-producted with
-        # the candidate patch at the same relative position inside the
-        # window, then averaged. Preserves the user's spatial arrangement
-        # (so a ridge intersection only matches another ridge intersection,
-        # not just any place with the same average texture).
-        best_score = -2.0
-        best_r0 = best_c0 = 0
-        best_cos_grid: Optional[np.ndarray] = None
-        # Pre-mask query template by valid query patches (qmask) so partial
-        # tile-fetch failures don't poison the score.
-        q_valid = qmask
-        n_qvalid = max(1, int(q_valid.sum()))
-        q_template = qtemplate  # (qry_rows, qry_cols, D), each row L2-normalised
-        for r0 in range(cluster_rows - qry_patch_rows + 1):
-            for c0 in range(cluster_cols - qry_patch_cols + 1):
-                window = stitched[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
-                wvalid = valid_mask[r0:r0 + qry_patch_rows, c0:c0 + qry_patch_cols]
-                joint = q_valid & wvalid
-                if joint.sum() < 0.7 * n_qvalid:
-                    continue  # too much of the window is over failed tiles
-                # Element-wise patch cosine; mean over valid positions.
-                cos_grid = (q_template * window).sum(axis=-1)  # (qry_rows, qry_cols)
-                s = float(cos_grid[joint].mean())
-                if s > best_score:
-                    best_score = s
-                    best_r0, best_c0 = r0, c0
-                    best_cos_grid = cos_grid.copy()
-
-        if best_score < -1.5:
-            continue  # all windows hit invalid tiles
+        # Spatial template matching via GPU-vectorised conv2d. Each output
+        # cell of the conv2d is the sum of element-wise patch dot products
+        # for one window position; argmax gives the best window, and we
+        # compute the per-patch cos_grid at that position for the heatmap.
+        scored = _score_template_torch(qtemplate, qmask, stitched, valid_mask)
+        if scored is None:
+            continue  # cluster too small or all windows hit invalid tiles
+        best_r0, best_c0, best_score, best_cos_grid = scored
 
         # Translate (r0, c0) inside the stitched grid back to (tile_x, tile_y, patch_r, patch_c).
         r1 = best_r0 + qry_patch_rows - 1
@@ -2041,14 +2079,31 @@ async function queryLatLon(lat, lon) {
     }
     const data = await resp.json();
     if (!data.query) { showError("Empty response from server."); return; }
-    renderQuery(data.query);
+    renderQuery(data.query, data.results || []);
     renderResults(data.results || [], "similarity");
   } catch (e) {
     showError(`Network error: ${e.message}`);
   }
 }
 
-function renderQuery(q) {
+function patchGridOverlay(rows, cols) {
+  // Faint white grid showing the patch boundaries the search actually
+  // used. Each cell == one DINO patch (~700 m at z=10).
+  if (!rows || !cols) return "";
+  const cells = [];
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      cells.push(
+        `<div style="position:absolute;left:${c*100/cols}%;top:${r*100/rows}%;` +
+        `width:${100/cols}%;height:${100/rows}%;` +
+        `box-shadow:inset 0 0 0 1px rgba(255,255,255,0.18);pointer-events:none"></div>`
+      );
+    }
+  }
+  return cells.join("");
+}
+
+function renderQuery(q, results) {
   document.getElementById("result-preview").innerHTML = "";  // reset on new search
   if (!q) {
     document.getElementById("query").innerHTML = `<p style="color:#f88">Empty query response.</p>`;
@@ -2056,16 +2111,28 @@ function renderQuery(q) {
   }
   const onErr = `this.onerror=null;this.style.opacity='.3';this.alt='tile unavailable'`;
   const b64 = q.preview_b64 || q.preview_png_b64;
-  const preview = q.tile_url
-    ? `<img src="${q.tile_url}" style="width:100%;max-width:320px;border:1px solid #333" onerror="${onErr}"/>`
-    : (b64 ? `<img src="data:image/jpeg;base64,${b64}" style="width:100%;max-width:320px;border:1px solid #333"/>` : "");
+  // Patch dimensions for the grid overlay: read off results[0]'s heatmap if
+  // available, otherwise no grid.
+  const hm0 = results && results.length ? results[0].match_heatmap : null;
+  const pr = hm0 && hm0.length ? hm0.length : 0;
+  const pc = hm0 && hm0[0] && hm0[0].length ? hm0[0].length : 0;
+  const grid = patchGridOverlay(pr, pc);
+  const previewSrc = q.tile_url
+    ? q.tile_url
+    : (b64 ? `data:image/jpeg;base64,${b64}` : null);
+  const preview = previewSrc ? `
+    <div style="position:relative;display:inline-block;max-width:320px">
+      <img src="${previewSrc}" style="display:block;width:100%;border:1px solid #333" onerror="${onErr}"/>
+      ${grid}
+    </div>` : "";
   const loc = (q.z !== undefined && q.x !== undefined)
     ? `z=${q.z} • tile (${q.x},${q.y})`
     : (q.bbox ? `bbox lat ${q.bbox.lat_min.toFixed(2)}..${q.bbox.lat_max.toFixed(2)}, lon ${q.bbox.lon_min.toFixed(2)}..${q.bbox.lon_max.toFixed(2)}` : "");
   const ll = (q.lat !== undefined && q.lon !== undefined)
     ? ` • lat ${q.lat.toFixed(2)} lon ${q.lon.toFixed(2)}`
     : "";
-  document.getElementById("query").innerHTML = `<h3>Query</h3>${preview}<p class="muted">${loc}${ll}</p>`;
+  const dims = (pr && pc) ? ` • ${pr}×${pc} patches` : "";
+  document.getElementById("query").innerHTML = `<h3>Query</h3>${preview}<p class="muted">${loc}${ll}${dims}</p>`;
 }
 
 function renderResults(results, scoreCol) {
@@ -2096,7 +2163,9 @@ function renderResults(results, scoreCol) {
           cells.push(
             `<div style="position:absolute;left:${c*100/cols}%;top:${r*100/rows}%;` +
             `width:${100/cols}%;height:${100/rows}%;` +
-            `background:hsla(${hue},80%,50%,0.45);pointer-events:none"></div>`
+            `background:hsla(${hue},80%,50%,0.45);` +
+            `box-shadow:inset 0 0 0 1px rgba(255,255,255,0.2);` +
+            `pointer-events:none"></div>`
           );
         }
       }
@@ -2334,7 +2403,7 @@ async function runStagedRegion() {
       return;
     }
     const data = await resp.json();
-    renderQuery(data.query);
+    renderQuery(data.query, data.results || []);
     renderResults(data.results || [], "similarity");
     stagedBbox = null;  // consumed; keep the rectangle visible as context
   } catch (e) {
