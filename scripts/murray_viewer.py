@@ -1351,19 +1351,16 @@ def api_query_bbox(q: BboxQuery) -> JSONResponse:
         # True sub-tile retrieval against the pre-built global patch index.
         # The composite is only used for the preview thumbnail — patch
         # matching itself works directly off whole-tile DINO outputs in
-        # _search_patches. Fetch the preview at search_zoom (a zoom whose
-        # tiles we actually have cached from the index build) instead of
-        # the auto-bumped fetch_z; the bump targets a zoom whose tiles
-        # nobody on this server has ever seen and each request was hitting
-        # upstream cold for ~8 z=11 tiles + a fallback walk back to z=10.
-        preview_img = _fetch_bbox_composite(
-            search_zoom, q.lat_min, q.lat_max, q.lon_min, q.lon_max
-        )
-        if _image_is_mostly_black(preview_img):
-            raise HTTPException(
-                status_code=502,
-                detail="Query region is empty — upstream tile server is failing. Retry in a moment.",
+        # _search_patches. Fetch best-effort: try search_zoom, fall back
+        # to coarser zooms if upstream is dropping tiles, and if even
+        # that fails just use a black placeholder rather than killing
+        # the whole query (the patch search runs independently anyway).
+        try:
+            preview_img, _used_z = _fetch_bbox_with_fallback(
+                search_zoom, q.lat_min, q.lat_max, q.lon_min, q.lon_max,
             )
+        except HTTPException:
+            preview_img = Image.new("RGB", (256, 256), (32, 32, 32))
         fetch_z = search_zoom
         results = _search_patches(
             q.lat_min, q.lat_max, q.lon_min, q.lon_max,
