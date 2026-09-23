@@ -10,7 +10,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from scientific_pipelines.core.embeddings import (
+from ctx_explorer.embeddings import (
     DINOv3Extractor,
     DINOv3HFExtractor,
     EmbeddingPipeline,

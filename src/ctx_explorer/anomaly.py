@@ -7,7 +7,7 @@ estimators behave sensibly.
 
 Typical use:
 
-    from scientific_pipelines.planetary.mars.ctx.anomaly import (
+    from ctx_explorer.anomaly import (
         score_and_persist_anomaly,
         top_k_anomalies,
     )

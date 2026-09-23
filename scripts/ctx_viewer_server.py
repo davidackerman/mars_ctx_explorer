@@ -31,14 +31,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from PIL import Image
 from pydantic import BaseModel
 
-from scientific_pipelines.core.embeddings import DINOv3HFExtractor
-from scientific_pipelines.planetary.mars.ctx.anomaly import (
+from ctx_explorer.embeddings import DINOv3HFExtractor
+from ctx_explorer.anomaly import (
     score_and_persist_anomaly,
     top_k_anomalies,
 )
-from scientific_pipelines.planetary.mars.ctx.atlas import build_atlas, load_atlas
-from scientific_pipelines.planetary.mars.ctx.patch_retrieval import CTXPatchIndex
-from scientific_pipelines.planetary.mars.ctx.retrieval import (
+from ctx_explorer.atlas import build_atlas, load_atlas
+from ctx_explorer.patch_retrieval import CTXPatchIndex
+from ctx_explorer.retrieval import (
     CTXSimilarityIndex,
     _load_grayscale_stretched,
 )

@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from scientific_pipelines.core.embeddings import DINOv3HFExtractor
-from scientific_pipelines.planetary.mars.ctx.patch_retrieval import CTXPatchIndex
+from ctx_explorer.embeddings import DINOv3HFExtractor
+from ctx_explorer.patch_retrieval import CTXPatchIndex
 
 logging.basicConfig(
     level=logging.INFO,

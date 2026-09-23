@@ -5,7 +5,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from scientific_pipelines.planetary.mars.ctx.downloader import CTXDownloader
+from ctx_explorer.downloader import CTXDownloader
 
 
 logging.basicConfig(

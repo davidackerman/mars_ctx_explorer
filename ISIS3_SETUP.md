@@ -89,7 +89,7 @@ pixi run python test_ctx_download.py
 Once ISIS3 is installed, the CTX downloader will automatically:
 
 ```python
-from scientific_pipelines.planetary.mars.ctx.downloader import CTXDownloader
+from ctx_explorer.downloader import CTXDownloader
 
 # Create downloader (ISIS3 enabled by default)
 downloader = CTXDownloader(output_dir="data/raw/ctx")

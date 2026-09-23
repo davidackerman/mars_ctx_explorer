@@ -3,16 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "scientific-pipelines"
-version = "0.2.0"
-description = "Multi-domain unsupervised ML pipelines for planetary and astronomical data analysis"
+name = "ctx-explorer"
+version = "0.1.0"
+description = "Drag-to-select similarity search over Mars CTX / Murray Lab mosaic imagery with DINOv3 embeddings and FAISS"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = {text = "BSD-3-Clause"}
-authors = [
-    {name = "David Ackerman", email = "ackermand@hhmi.org"}
-]
-keywords = ["mars", "astronomy", "unsupervised-learning", "clustering", "machine-learning", "pytorch", "ctx", "wise", "brown-dwarfs"]
+authors = [{name = "David Ackerman", email = "ackermand@hhmi.org"}]
+keywords = ["mars", "ctx", "murray-lab", "image-retrieval", "dinov3", "faiss", "similarity-search"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -22,74 +20,37 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-
-# Core dependencies (PyPI)
 dependencies = [
     "torch>=2.0.0",
     "torchvision>=0.15.0",
-    "torchmetrics>=1.0.0",
     "numpy>=1.26.0,<2.4",
     "pillow>=10.0.0",
     "requests>=2.31.0",
-    "pyyaml>=6.0",
     "tqdm>=4.66.0",
     "pandas>=2.2.0",
-    "matplotlib>=3.8.0",
-    "seaborn>=0.13.0",
     "scipy>=1.12.0",
     "scikit-learn>=1.4.0",
-    "h5py>=3.10.0",
-    "xmltodict>=0.13.0",
-    "python-dotenv>=1.0.0",
-    "beautifulsoup4>=4.12.0",
-    # New dependencies for multi-domain pipelines
-    "hdbscan>=0.8.33",        # HDBSCAN clustering
-    "umap-learn>=0.5.5",      # UMAP dimensionality reduction
-    "timm>=0.9.0",            # PyTorch Image Models (for DINOv2)
-    "panoptes-client>=1.6.0", # Zooniverse Panoptes API
-    "pyarrow>=14.0.0",        # Parquet file support
-    "faiss-cpu>=1.7.4",       # Fast kNN for novelty detection
-    "numba>=0.59.0",          # JIT compiler (required for UMAP, needs 0.59+ for Python 3.12+)
-    "termcolor>=2.0.0",       # Colored terminal output (required by DINOv3)
-    "tensorboard>=2.15.0", "streamlit-cropper>=0.3.1,<0.4", "fastapi>=0.110", "uvicorn[standard]>=0.27",    # TensorBoard for training visualization
+    "hdbscan>=0.8.33",
+    "umap-learn>=0.5.5",
+    "numba>=0.59.0",
+    "pyarrow>=14.0.0",
+    "faiss-cpu>=1.7.4",
+    "termcolor>=2.0.0",       # required by DINOv3 torch.hub code
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.0",
+    "streamlit>=1.40.0",
+    "streamlit-cropper>=0.3.1,<0.4",
 ]
 
-# Optional dependency groups (managed by Pixi - see tool.pixi.feature sections)
-
 [project.urls]
-Repository = "https://github.com/davidackerman/mars_astrobio"
-Issues = "https://github.com/davidackerman/mars_astrobio/issues"
+Repository = "https://github.com/davidackerman/mars_ctx_explorer"
+Issues = "https://github.com/davidackerman/mars_ctx_explorer/issues"
 
-[project.scripts]
-# Multi-domain pipeline scripts
-ctx-terrain-pipeline = "scientific_pipelines.planetary.mars.ctx.scripts:run_pipeline"
-backyard-worlds-pipeline = "scientific_pipelines.astronomy.backyard_worlds.scripts:run_pipeline"
-
-# Pixi configuration
 [tool.pixi.project]
 channels = ["conda-forge", "pytorch"]
 platforms = ["linux-64"]
 
-# Pixi dependencies (conda packages)
-[tool.pixi.dependencies]
-python = "3.12.*"
-pytorch = {version = ">=2.0.0", channel = "pytorch", build = "*cuda*"}
-torchvision = {version = ">=0.15.0", channel = "pytorch"}
-numpy = ">=1.26.0,<2.4"
-gdal = ">=3.8.0"
-opencv = ">=4.12.0,<5"
-transformers = ">=4.56.0,<5.0"
-huggingface_hub = ">=0.34.0,<1.0"
-pyarrow = ">=22.0.0,<23"
-imageio = ">=2.34.0,<3"
-# Note: ISIS3 has dependency conflicts with Python 3.12
-# Install it in a separate conda environment (see ISIS3_SETUP.md)
-
-# PyPI dependencies auto-read from [project.dependencies]
-[tool.pixi.pypi-dependencies]
-scientific-pipelines = { path = ".", editable = true }
-
-# Development environment with extras
 [tool.pixi.feature.dev.pypi-dependencies]
 pytest = ">=8.0.0"
 pytest-cov = ">=4.1.0"
@@ -97,40 +58,15 @@ black = ">=24.0.0"
 ruff = ">=0.2.0"
 mypy = ">=1.8.0"
 pre-commit = ">=3.6.0"
-streamlit = ">=1.40.0"
 
-[tool.pixi.feature.notebooks.pypi-dependencies]
-jupyter = ">=1.0.0"
-jupyterlab = ">=4.0.0"
-ipywidgets = ">=8.1.0"
-plotly = ">=5.18.0"
-
-# Define environments
 [tool.pixi.environments]
 default = {features = ["dev"], solve-group = "default"}
-notebooks = {features = ["dev", "notebooks"], solve-group = "default"}
 prod = {solve-group = "default"}
 
-# Pixi tasks (command shortcuts)
-[tool.pixi.tasks]
-# Development tasks
-test = "pytest tests/ -v --cov=scientific_pipelines"
-lint = "ruff check src/ tests/"
-format = "black src/ tests/"
-typecheck = "mypy src/"
-notebook = "jupyter lab notebooks/"
-# Pipeline tasks
-ctx-pipeline = "ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml"
-backyard-worlds = "backyard-worlds-pipeline --config configs/pipelines/backyard_worlds.yaml"
-ctx-download = "python scripts/download_ctx_images.py --output-dir data/raw/ctx --limit 100"
-ctx-build-sim-index = "python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity"
-ctx-similarity-app = "streamlit run scripts/ctx_similarity_app.py -- --index-dir outputs/ctx_similarity"
-
-# Tool-specific configurations
 [tool.black]
 line-length = 100
-target-version = ['py310', 'py311', 'py312']
-include = '\.pyi?$'
+target-version = ["py310", "py311", "py312"]
+include = "\\.pyi?$"
 
 [tool.ruff]
 line-length = 100
@@ -142,7 +78,6 @@ lint.ignore = ["E203", "E501"]
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
-addopts = "-v --cov=scientific_pipelines --cov-report=html --cov-report=term"
 
 [tool.mypy]
 python_version = "3.10"
@@ -151,5 +86,35 @@ warn_unused_configs = true
 disallow_untyped_defs = false
 ignore_missing_imports = true
 
+[tool.pixi.dependencies]
+python = "3.12.*"
+pytorch = {version = ">=2.0.0", channel = "pytorch", build = "*cuda*"}
+torchvision = {version = ">=0.15.0", channel = "pytorch"}
+numpy = ">=1.26.0,<2.4"
+gdal = ">=3.8.0"
+opencv = ">=4.12.0,<5"
+transformers = ">=4.56.0,<5.0"
+huggingface_hub = ">=0.34.0,<1.0"
+pyarrow = ">=22.0.0,<23"
+# ISIS3 conflicts with Python 3.12 — install it in a separate conda env (see ISIS3_SETUP.md)
+
+[tool.pixi.pypi-dependencies]
+ctx-explorer = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+test = "pytest tests/ -v"
+lint = "ruff check src/ scripts/ tests/"
+format = "black src/ scripts/ tests/"
+typecheck = "mypy src/"
+ctx-download = "python scripts/download_ctx_images.py --output-dir data/raw/ctx --limit 100"
+ctx-pipeline = "python scripts/run_ctx_pipeline.py"
+ctx-build-sim-index = "python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity"
+ctx-build-patch-index = "python scripts/build_ctx_patch_index.py"
+ctx-similarity-app = "streamlit run scripts/ctx_similarity_app.py -- --index-dir outputs/ctx_similarity"
+ctx-viewer = "python scripts/ctx_viewer_server.py"
+murray-index = "python scripts/stream_murray_index.py"
+murray-patch-index = "python scripts/stream_murray_patch_index.py"
+murray-viewer = "python scripts/murray_viewer.py"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/scientific_pipelines"]
+packages = ["src/ctx_explorer"]

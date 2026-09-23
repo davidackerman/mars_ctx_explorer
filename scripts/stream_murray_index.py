@@ -214,7 +214,7 @@ def run(
     # --- Extractor ------------------------------------------------------- #
     os.environ.setdefault("HF_HOME", "/mnt/bigdisk/hf_cache")
     os.environ.setdefault("HF_HUB_CACHE", "/mnt/bigdisk/hf_cache/hub")
-    from scientific_pipelines.core.embeddings import DINOv3HFExtractor
+    from ctx_explorer.embeddings import DINOv3HFExtractor
 
     extractor = DINOv3HFExtractor(model_name=model_name, device="cuda", use_half_precision=True)
     transform = DINOv3HFExtractor.get_default_transforms(

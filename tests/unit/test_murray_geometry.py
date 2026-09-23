@@ -1,7 +1,7 @@
 import numpy as np
 from PIL import Image, ImageDraw
 
-from scientific_pipelines.core.embeddings.dinov3_hf import DINOv3HFExtractor
+from ctx_explorer.embeddings.dinov3_hf import DINOv3HFExtractor
 from scripts import murray_viewer, stream_murray_index
 
 

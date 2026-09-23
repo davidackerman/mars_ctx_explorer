@@ -12,9 +12,9 @@ import streamlit as st
 from PIL import Image
 from streamlit_cropper import st_cropper
 
-from scientific_pipelines.core.embeddings import DINOv3Extractor, DINOv3HFExtractor
-from scientific_pipelines.planetary.mars.ctx.patch_retrieval import CTXPatchIndex
-from scientific_pipelines.planetary.mars.ctx.retrieval import CTXSimilarityIndex
+from ctx_explorer.embeddings import DINOv3Extractor, DINOv3HFExtractor
+from ctx_explorer.patch_retrieval import CTXPatchIndex
+from ctx_explorer.retrieval import CTXSimilarityIndex
 
 Image.MAX_IMAGE_PIXELS = None
 

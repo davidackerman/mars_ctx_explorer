@@ -29,9 +29,9 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from scientific_pipelines.core.embeddings import DINOv3HFExtractor, EmbeddingPipeline
-from scientific_pipelines.planetary.mars.ctx.downloader import CTXDownloader
-from scientific_pipelines.planetary.mars.ctx.retrieval import (
+from ctx_explorer.embeddings import DINOv3HFExtractor, EmbeddingPipeline
+from ctx_explorer.downloader import CTXDownloader
+from ctx_explorer.retrieval import (
     CTXSimilarityIndex,
     discover_images,
     generate_chunk_tiles,

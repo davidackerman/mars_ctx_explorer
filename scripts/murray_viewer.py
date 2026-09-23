@@ -250,7 +250,7 @@ def _load(index_root: Path, patch_root: Optional[Path] = None) -> None:
 
     os.environ.setdefault("HF_HOME", "/mnt/bigdisk/hf_cache")
     os.environ.setdefault("HF_HUB_CACHE", "/mnt/bigdisk/hf_cache/hub")
-    from scientific_pipelines.core.embeddings import DINOv3HFExtractor
+    from ctx_explorer.embeddings import DINOv3HFExtractor
 
     APP_STATE["extractor_cls"] = DINOv3HFExtractor
     APP_STATE["transforms"] = {}

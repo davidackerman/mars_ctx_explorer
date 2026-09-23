@@ -5,7 +5,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from scientific_pipelines.planetary.mars.ctx.retrieval import (
+from ctx_explorer.retrieval import (
     CTXSimilarityIndex,
     build_ctx_embeddings,
     discover_images,

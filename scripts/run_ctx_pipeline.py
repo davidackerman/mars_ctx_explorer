@@ -23,7 +23,7 @@ import logging
 import os
 from pathlib import Path
 
-from scientific_pipelines.planetary.mars.ctx.pipeline_runner import (
+from ctx_explorer.pipeline_runner import (
     PipelineConfig,
     run,
 )
