@@ -1,152 +1,47 @@
-checkpoints/
-
 # Python
-outputs/
-isis3data/
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 build/
-develop-eggs/
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# Pixi
+# Pixi (pixi.lock is committed)
 .pixi/
-# Keep pixi.lock committed for reproducibility
 
-# Virtual Environments
+# Environment / secrets
 .env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+.env.*
+.venv/
 
-# IDEs
-data/backyard_worlds/subjects_toprand_1000
-data/backyard_worlds/subjects/
-data/backyard_worlds/synthetic_*/
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-*.sublime-project
-*.sublime-workspace
-
-# Jupyter Notebook
-.ipynb_checkpoints/
-*.ipynb_checkpoints
-
-# Data directories (large files - don't commit)
-data/raw/*
-!data/raw/README.md
-data/processed/*
-!data/processed/README.md
-data/cache/*
-!data/cache/README.md
-data/annotations/*
-!data/annotations/README.md
-data/cheyava_falls/*
-!data/cheyava_falls/README.md
-data/cheyava_falls_official/*
-!data/cheyava_falls_official/README.md
-data/mars_official/*
-!data/mars_official/README.md
-data/pipeline_test/*
-!data/pipeline_test/README.md
-data/test_downloads/*
-!data/test_downloads/README.md
-data/test_outputs/*
-!data/test_outputs/README.md
-
-# Model checkpoints (large files - don't commit)
-models/checkpoints/*
-!models/checkpoints/README.md
-models/production/*
-!models/production/README.md
-
-# Outputs
-outputs/predictions/*
-outputs/visualizations/*
-outputs/reports/*
-!outputs/*/README.md
-
-# Testing
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
 .coverage.*
 htmlcov/
-.pytest_cache/
-.tox/
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
+.ipynb_checkpoints/
 
-# Logs
-*.log
-logs/
-wandb/
-tensorboard/
-mlruns/
-
-# ISIS3 runtime log
-print.prt
-
-# Temporary files
-*.tmp
-*.bak
+# Editors / OS
+.vscode/
+.idea/
+.claude/settings.local.json
 *.swp
-temp/
-tmp/
-test_output.png
-test_conversion.py
-check_png.py
-check_converted.py
-
-# Test and debug files
-*.png
-*.bat
-debug_*.py
-test_*.py
-!tests/test_*.py
-!tests/**/test_*.py
-
-# OS
+*~
 .DS_Store
-Thumbs.db
 
-# Documentation builds
-docs/_build/
-docs/_static/
-docs/_templates/
+# Runtime artefacts
+outputs/
+logs/
+checkpoints/
+*.log
+nohup.out
+print.prt
+tmp/
+temp/
 
-# MyPy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Ruff
-.ruff_cache/
-
-# Environment variables (may contain API keys)
-.env
-.env.local
-.env.*.local
+# Data (large)
+data/raw/
+data/isis3data/
+isis3data/

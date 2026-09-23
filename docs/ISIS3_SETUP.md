@@ -22,7 +22,7 @@ After processing, craters and other features appear correctly shaped.
 
 ```bash
 # Run the automated setup script
-./setup_isis3.sh
+./scripts/setup_isis3.sh
 
 # Follow the post-installation steps to activate and configure
 ```

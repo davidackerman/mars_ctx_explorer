@@ -261,7 +261,7 @@ _ISIS3_CANDIDATE_ROOTS = [
     os.path.expanduser("~/miniconda3/envs/isis3"),
     os.path.expanduser("~/anaconda3/envs/isis3"),
 ]
-_ISISDATA_CANDIDATE = "/mnt/bigdisk/Programming/mars_astrobio/data/isis3data"
+_ISISDATA_CANDIDATE = str(Path(__file__).resolve().parents[2] / "data" / "isis3data")
 
 
 def _ensure_isis3_env(cfg: PipelineConfig) -> None:

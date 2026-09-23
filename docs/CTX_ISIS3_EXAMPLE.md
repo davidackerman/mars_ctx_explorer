@@ -78,7 +78,7 @@ The pipeline will automatically:
 pixi run python test_ctx_download.py
 
 # Check output
-pixi run python check_tif.py
+pixi run python scripts/check_tif.py
 
 # Clean up and try again
 rm -rf data/test/ctx_single/*

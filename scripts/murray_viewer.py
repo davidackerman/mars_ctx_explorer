@@ -325,7 +325,9 @@ def _apply_aspect_correction(img: Image.Image, lat_center: float) -> Image.Image
 
 TILE_CACHE: dict[tuple[int, int, int], bytes] = {}
 TILE_CACHE_MAX = 4096
-TILE_CACHE_DIR = Path("/mnt/bigdisk/Programming/mars_astrobio/outputs/tile_cache")
+TILE_CACHE_DIR = Path(
+    os.environ.get("MURRAY_TILE_CACHE_DIR", Path(__file__).resolve().parents[1] / "outputs" / "tile_cache")
+)
 
 
 def _disk_cache_path(z: int, x: int, y: int) -> Path:

@@ -4,7 +4,7 @@
 
 ```bash
 # 1. Run setup script
-./setup_isis3.sh
+./scripts/setup_isis3.sh
 
 # 2. Activate ISIS3 environment and download SPICE data
 conda activate isis3

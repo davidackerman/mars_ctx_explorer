@@ -47,7 +47,7 @@ dependencies = [
 Repository = "https://github.com/davidackerman/mars_ctx_explorer"
 Issues = "https://github.com/davidackerman/mars_ctx_explorer/issues"
 
-[tool.pixi.project]
+[tool.pixi.workspace]
 channels = ["conda-forge", "pytorch"]
 platforms = ["linux-64"]
 
@@ -96,7 +96,7 @@ opencv = ">=4.12.0,<5"
 transformers = ">=4.56.0,<5.0"
 huggingface_hub = ">=0.34.0,<1.0"
 pyarrow = ">=22.0.0,<23"
-# ISIS3 conflicts with Python 3.12 — install it in a separate conda env (see ISIS3_SETUP.md)
+# ISIS3 conflicts with Python 3.12 — install it in a separate conda env (see docs/ISIS3_SETUP.md)
 
 [tool.pixi.pypi-dependencies]
 ctx-explorer = { path = ".", editable = true }

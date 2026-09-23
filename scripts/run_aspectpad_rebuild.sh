@@ -14,7 +14,7 @@ mkdir -p "$OUT" "$LOG"
 PY=".pixi/envs/default/bin/python"
 export HF_HOME=/mnt/bigdisk/hf_cache
 export HF_HUB_CACHE=/mnt/bigdisk/hf_cache/hub
-export HF_TOKEN=$(cat /home/ackermand@hhmi.org/.cache/huggingface/token 2>/dev/null || echo "")
+export HF_TOKEN="${HF_TOKEN:-$(cat ~/.cache/huggingface/token 2>/dev/null || echo "")}"
 
 echo "=== $(date -Iseconds): START z8 CLS ==="
 $PY scripts/stream_murray_index.py \

@@ -38,6 +38,9 @@ pixi run murray-viewer --index-dir outputs/murray_z8_cls
 `scripts/run_aspectpad_rebuild.sh` rebuilds all four production indexes (z8/z10, CLS/patch)
 sequentially with the current preprocessing settings.
 
+The Murray viewer caches fetched tiles on disk under `outputs/tile_cache/` by default; set
+`MURRAY_TILE_CACHE_DIR` to point it elsewhere (for example at an existing cache).
+
 ## Quick start: local CTX products
 
 ```bash
@@ -58,7 +61,7 @@ Index artifacts: `embeddings.parquet`, `faiss.index`, `metadata.parquet`, plus a
 `*.model.json` sidecar recording the model and preprocessing used to build the index.
 
 ISIS3 conflicts with Python 3.12 and lives in its own conda environment. See
-[ISIS3_SETUP.md](ISIS3_SETUP.md) and [QUICKSTART_ISIS3.md](QUICKSTART_ISIS3.md).
+[docs/ISIS3_SETUP.md](docs/ISIS3_SETUP.md) and [docs/QUICKSTART_ISIS3.md](docs/QUICKSTART_ISIS3.md).
 
 ## Deploying to Hugging Face Spaces
 
@@ -81,8 +84,10 @@ scripts/
 ├── murray_viewer.py, stream_murray_index.py, stream_murray_patch_index.py
 ├── ctx_viewer_server.py, ctx_similarity_app.py
 ├── run_ctx_pipeline.py, build_ctx_retrieval_index.py, build_ctx_patch_index.py
-└── download_ctx_images.py
+├── download_ctx_images.py, setup_isis3.sh, check_tif.py
+└── run_aspectpad_rebuild.sh
 tests/unit/test_murray_geometry.py
+docs/                    # ISIS3 setup + HF Spaces deployment
 ```
 
 ## Development

@@ -16,9 +16,9 @@ and push updated indexes by re-uploading to the dataset (cheap).
    git clone https://huggingface.co/spaces/yourname/ctx-similarity
    cd ctx-similarity
    # Copy repo contents into the Space's git working tree
-   cp -r ../mars_astrobio/Dockerfile ../mars_astrobio/app.py \
-         ../mars_astrobio/src ../mars_astrobio/scripts \
-         ../mars_astrobio/pyproject.toml .
+   cp -r ../mars_ctx_explorer/Dockerfile ../mars_ctx_explorer/app.py \
+         ../mars_ctx_explorer/src ../mars_ctx_explorer/scripts \
+         ../mars_ctx_explorer/pyproject.toml .
    git add . && git commit -m "Initial CTX viewer" && git push
    ```
 
