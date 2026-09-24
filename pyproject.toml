@@ -25,6 +25,7 @@ dependencies = [
     "torchvision>=0.15.0",
     "numpy>=1.26.0,<2.4",
     "pillow>=10.0.0",
+    "pyyaml>=6.0",
     "requests>=2.31.0",
     "tqdm>=4.66.0",
     "pandas>=2.2.0",
@@ -46,6 +47,9 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/davidackerman/mars_ctx_explorer"
 Issues = "https://github.com/davidackerman/mars_ctx_explorer/issues"
+
+[project.scripts]
+ctx-terrain-pipeline = "ctx_explorer.terrain.cli:run_pipeline"
 
 [tool.pixi.workspace]
 channels = ["conda-forge", "pytorch"]
@@ -111,6 +115,7 @@ ctx-pipeline = "python scripts/run_ctx_pipeline.py"
 ctx-build-sim-index = "python scripts/build_ctx_retrieval_index.py --image-dir data/raw/ctx --index-dir outputs/ctx_similarity"
 ctx-build-patch-index = "python scripts/build_ctx_patch_index.py"
 ctx-similarity-app = "streamlit run scripts/ctx_similarity_app.py -- --index-dir outputs/ctx_similarity"
+ctx-terrain = "ctx-terrain-pipeline --config configs/ctx_terrain.yaml"
 ctx-viewer = "python scripts/ctx_viewer_server.py"
 murray-index = "python scripts/stream_murray_index.py"
 murray-patch-index = "python scripts/stream_murray_patch_index.py"

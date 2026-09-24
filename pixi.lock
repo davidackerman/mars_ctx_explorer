@@ -5423,6 +5423,7 @@ packages:
   - torchvision>=0.15.0
   - numpy>=1.26.0,<2.4
   - pillow>=10.0.0
+  - pyyaml>=6.0
   - requests>=2.31.0
   - tqdm>=4.66.0
   - pandas>=2.2.0

@@ -4,11 +4,11 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
-from scientific_pipelines.core.clustering import HDBSCANClusterer, NoveltyDetector
-from scientific_pipelines.core.embeddings import DINOv3Extractor, EmbeddingPipeline
+from ctx_explorer.clustering import HDBSCANClusterer, NoveltyDetector
+from ctx_explorer.embeddings import DINOv3Extractor, EmbeddingPipeline
 
 from .tiling import CTXTiler
 
@@ -43,17 +43,11 @@ class CTXTerrainPipeline:
         tiling_config = config.get('tiling', {})
         self.tiler = CTXTiler(**tiling_config)
 
-        # Embedding extractor
-        embedding_config = config.get('embedding', {})
-        self.embedder = DINOv3Extractor(**embedding_config)
-
-        # Embedding pipeline
-        embedding_pipeline_config = config.get('embedding_pipeline', {})
-        self.embedding_pipeline = EmbeddingPipeline(
-            extractor=self.embedder,
-            transform=DINOv3Extractor.get_default_transforms(),
-            **embedding_pipeline_config,
-        )
+        # The DINOv3 extractor is built lazily: run_from_embeddings() never
+        # needs it, and torch.hub model loading is slow.
+        self._embedding_config = config.get('embedding', {})
+        self._embedding_pipeline_config = config.get('embedding_pipeline', {})
+        self._embedding_pipeline: Optional[EmbeddingPipeline] = None
 
         # Clustering
         clustering_config = config.get('clustering', {})
@@ -64,6 +58,17 @@ class CTXTerrainPipeline:
         self.novelty_detector = NoveltyDetector(**novelty_config)
 
         logger.info("CTX terrain classification pipeline initialized")
+
+    @property
+    def embedding_pipeline(self) -> EmbeddingPipeline:
+        if self._embedding_pipeline is None:
+            embedder = DINOv3Extractor(**self._embedding_config)
+            self._embedding_pipeline = EmbeddingPipeline(
+                extractor=embedder,
+                transform=DINOv3Extractor.get_default_transforms(),
+                **self._embedding_pipeline_config,
+            )
+        return self._embedding_pipeline
 
     def run(
         self,
@@ -150,89 +155,31 @@ class CTXTerrainPipeline:
 
             table = pq.read_table(embeddings_output)
             df = table.to_pandas()
-            embeddings = pd.np.vstack(df['embedding'].values)
+            embeddings = np.vstack(df['embedding'].values)
             emb_metadata = df.drop(columns=['embedding'])
 
             logger.info(f"Loaded embeddings: shape={embeddings.shape}")
 
-        # Step 3: Cluster with HDBSCAN
-        logger.info("\n" + "=" * 80)
-        logger.info("STEP 3: Clustering Tiles with HDBSCAN")
-        logger.info("=" * 80)
-
-        cluster_results = self.clusterer.fit_predict(embeddings)
-
-        # Save cluster results
-        clusters_df = pd.DataFrame(
+        meta_df = pd.DataFrame(
             {
                 'tile_path': [t['tile_path'] for t in valid_tiles],
                 'source_image': [t['source_image'] for t in valid_tiles],
                 'x_offset': [t['x_offset'] for t in valid_tiles],
                 'y_offset': [t['y_offset'] for t in valid_tiles],
-                'cluster_id': cluster_results['labels'],
-                'cluster_probability': cluster_results['probabilities'],
-                'outlier_score': cluster_results['outlier_scores'],
             }
         )
-
-        clusters_csv_path = self.output_dir / "tile_clusters.csv"
-        clusters_df.to_csv(clusters_csv_path, index=False)
-        logger.info(f"Cluster results saved to {clusters_csv_path}")
-
-        # Print cluster statistics
-        logger.info(f"Clustering results:")
-        logger.info(f"  Number of clusters: {cluster_results['n_clusters']}")
-        logger.info(f"  Noise points: {cluster_results['noise_count']}")
-        logger.info(f"  Noise fraction: {cluster_results['noise_fraction']:.1%}")
-
-        for cluster_id in sorted(
-            [k for k in cluster_results['cluster_sizes'].keys() if k != -1]
-        ):
-            size = cluster_results['cluster_sizes'][cluster_id]
-            logger.info(f"  Cluster {cluster_id}: {size} tiles")
-
-        # Step 4: Compute novelty scores
-        logger.info("\n" + "=" * 80)
-        logger.info("STEP 4: Computing Novelty Scores")
-        logger.info("=" * 80)
-
-        self.novelty_detector.fit(embeddings, cluster_results['labels'])
-        novelty_scores = self.novelty_detector.score(embeddings, cluster_results['labels'])
-
-        # Get top novel tiles
-        top_k = self.config.get('gallery', {}).get('top_n_outliers', 100)
-        top_novel_indices = self.novelty_detector.get_top_k_novel(novelty_scores, k=top_k)
-
-        # Save novelty results
-        novelty_df = pd.DataFrame(
-            {
-                'tile_path': [t['tile_path'] for t in valid_tiles],
-                'novelty_score': novelty_scores,
-                'is_outlier': cluster_results['labels'] == -1,
-                'is_top_novel': [
-                    i in top_novel_indices for i in range(len(valid_tiles))
-                ],
-            }
+        cluster_results, novelty_scores = self._cluster_and_score(
+            embeddings, meta_df, key_column='tile_path'
         )
 
-        novelty_csv_path = self.output_dir / "tile_novelty.csv"
-        novelty_df.to_csv(novelty_csv_path, index=False)
-        logger.info(f"Novelty scores saved to {novelty_csv_path}")
-
-        logger.info(f"Novelty statistics:")
-        logger.info(f"  Mean novelty score: {novelty_scores.mean():.3f}")
-        logger.info(f"  Max novelty score: {novelty_scores.max():.3f}")
-        logger.info(f"  Top {top_k} most novel tiles identified")
-
-        # Pipeline complete
         logger.info("\n" + "=" * 80)
         logger.info("CTX Terrain Classification Pipeline Complete!")
         logger.info("=" * 80)
         logger.info(f"All outputs saved to: {self.output_dir}")
-        logger.info(f"  - tiles.csv: Tile metadata")
-        logger.info(f"  - embeddings.parquet: DINOv3 embeddings")
-        logger.info(f"  - tile_clusters.csv: Cluster assignments")
-        logger.info(f"  - tile_novelty.csv: Novelty scores")
+        logger.info("  - tiles.csv: Tile metadata")
+        logger.info("  - embeddings.parquet: DINOv3 embeddings")
+        logger.info("  - tile_clusters.csv: Cluster assignments")
+        logger.info("  - tile_novelty.csv: Novelty scores")
 
         return {
             'tiles_metadata': tiles_metadata,
@@ -240,3 +187,90 @@ class CTXTerrainPipeline:
             'cluster_results': cluster_results,
             'novelty_scores': novelty_scores,
         }
+
+    def run_from_embeddings(
+        self, embeddings_path: Path, key_column: Optional[str] = None
+    ) -> Dict:
+        """Cluster and novelty-score an existing embeddings parquet.
+
+        Skips download, tiling and embedding entirely. Any parquet with an
+        ``embedding`` column works, including ``embeddings.parquet`` written by
+        the similarity-index builders (``build_ctx_retrieval_index.py``,
+        ``run_ctx_pipeline.py``), so terrain clustering can be run over the
+        same tiles the viewer searches.
+
+        Args:
+            embeddings_path: Parquet with an ``embedding`` column plus per-row
+                metadata (``image_path``, ``tile_path``, lat/lon, ...).
+            key_column: Column identifying each row in the outputs. Defaults to
+                ``tile_path`` if present, else ``image_path``.
+        """
+        embeddings_path = Path(embeddings_path)
+        logger.info(f"Loading embeddings from {embeddings_path}")
+        df = pd.read_parquet(embeddings_path)
+        if 'embedding' not in df.columns:
+            raise ValueError(f"{embeddings_path} has no 'embedding' column")
+        embeddings = np.vstack(df['embedding'].values).astype(np.float32)
+        meta_df = df.drop(columns=['embedding']).reset_index(drop=True)
+        if key_column is None:
+            key_column = 'tile_path' if 'tile_path' in meta_df.columns else 'image_path'
+        if key_column not in meta_df.columns:
+            raise ValueError(f"key column '{key_column}' not in {list(meta_df.columns)}")
+        logger.info(f"Loaded {len(meta_df)} embeddings of dim {embeddings.shape[1]}")
+
+        cluster_results, novelty_scores = self._cluster_and_score(
+            embeddings, meta_df, key_column=key_column
+        )
+        return {
+            'embeddings': embeddings,
+            'cluster_results': cluster_results,
+            'novelty_scores': novelty_scores,
+        }
+
+    def _cluster_and_score(
+        self, embeddings: np.ndarray, meta_df: pd.DataFrame, key_column: str
+    ):
+        """HDBSCAN clustering + novelty scoring; writes tile_clusters.csv and tile_novelty.csv.
+
+        Cluster ids are arbitrary integers (-1 = noise). Nothing here names a
+        cluster "crater" or "dune"; interpreting clusters is a manual step, and
+        the similarity viewer is the tool for it.
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("Clustering tiles with HDBSCAN")
+        logger.info("=" * 80)
+        cluster_results = self.clusterer.fit_predict(embeddings)
+
+        clusters_df = meta_df.copy()
+        clusters_df['cluster_id'] = cluster_results['labels']
+        clusters_df['cluster_probability'] = cluster_results['probabilities']
+        clusters_df['outlier_score'] = cluster_results['outlier_scores']
+        clusters_csv_path = self.output_dir / "tile_clusters.csv"
+        clusters_df.to_csv(clusters_csv_path, index=False)
+        logger.info(f"Cluster results saved to {clusters_csv_path}")
+        logger.info(f"  Number of clusters: {cluster_results['n_clusters']}")
+        logger.info(f"  Noise points: {cluster_results['noise_count']}")
+        logger.info(f"  Noise fraction: {cluster_results['noise_fraction']:.1%}")
+
+        logger.info("\n" + "=" * 80)
+        logger.info("Computing novelty scores")
+        logger.info("=" * 80)
+        self.novelty_detector.fit(embeddings, cluster_results['labels'])
+        novelty_scores = self.novelty_detector.score(embeddings, cluster_results['labels'])
+        top_k = self.config.get('gallery', {}).get('top_n_outliers', 100)
+        top_novel = set(np.asarray(self.novelty_detector.get_top_k_novel(novelty_scores, k=top_k)).tolist())
+
+        novelty_df = pd.DataFrame(
+            {
+                key_column: meta_df[key_column].values,
+                'novelty_score': novelty_scores,
+                'is_outlier': cluster_results['labels'] == -1,
+                'is_top_novel': [i in top_novel for i in range(len(meta_df))],
+            }
+        )
+        novelty_csv_path = self.output_dir / "tile_novelty.csv"
+        novelty_df.to_csv(novelty_csv_path, index=False)
+        logger.info(f"Novelty scores saved to {novelty_csv_path}")
+        logger.info(f"  Mean novelty score: {novelty_scores.mean():.3f}")
+        logger.info(f"  Max novelty score: {novelty_scores.max():.3f}")
+        return cluster_results, novelty_scores

@@ -29,19 +29,22 @@ def run_pipeline():
         epilog="""
 Examples:
   # Download and process 100 images
-  ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --download --download-limit 100
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --download --download-limit 100
 
   # Download images from specific region (Jezero crater)
-  ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --download --download-region -77.5 -77.0 18.0 18.5
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --download --download-region -77.5 -77.0 18.0 18.5
 
   # Run with custom image directory (already downloaded)
-  ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --images data/raw/ctx/
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --images data/raw/ctx/
+
+  # Cluster the tiles of an existing similarity index instead
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --embeddings outputs/ctx_similarity/embeddings.parquet --output outputs/ctx_terrain
 
   # Skip tiling (use existing tiles)
-  ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --skip-tiling
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --skip-tiling
 
   # Skip embedding extraction (use existing embeddings)
-  ctx-terrain-pipeline --config configs/pipelines/ctx_terrain.yaml --skip-embedding
+  ctx-terrain-pipeline --config configs/ctx_terrain.yaml --skip-embedding
         """,
     )
 
@@ -62,6 +65,15 @@ Examples:
         '--output',
         type=Path,
         help='Output directory (overrides config)',
+    )
+
+    parser.add_argument(
+        '--embeddings',
+        type=Path,
+        help=(
+            'Cluster an existing embeddings parquet (e.g. embeddings.parquet from a '
+            'similarity-index build) and skip download, tiling and embedding'
+        ),
     )
 
     parser.add_argument(
@@ -107,12 +119,18 @@ Examples:
     # Override output directory if specified
     output_dir = args.output or Path(config.get('output_dir', 'outputs/ctx_terrain'))
 
+    if args.embeddings:
+        pipeline = CTXTerrainPipeline(config, output_dir)
+        pipeline.run_from_embeddings(args.embeddings)
+        logger.info("Pipeline completed successfully!")
+        return
+
     # Get image paths
     image_paths = None
     if not args.skip_tiling:
         # Download images if requested
         if args.download:
-            from .downloader import CTXDownloader
+            from ctx_explorer.downloader import CTXDownloader
 
             logger.info("=" * 80)
             logger.info("DOWNLOAD STEP: Fetching CTX images from NASA PDS")
