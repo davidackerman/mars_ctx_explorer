@@ -22,7 +22,7 @@ biosignature project this grew out of) and
 
 ![Drawing a box over fretted terrain in Deuteronilus Mensae and finding similar terrain around the planet](docs/images/fretted-terrain-search.webp)
 
-*A box drawn over the fretted mesas of Deuteronilus Mensae, searched against the zoom-8 patch index of the public Murray Lab CTX mosaic with spread-out results. The matches ring the northern mid-latitudes, up to about 5,800 km away. The 27-second search wait is shortened in this recording.*
+*Zooming in on the fretted mesas of Deuteronilus Mensae, drawing a box and searching the zoom-8 patch index of the public Murray Lab CTX mosaic. Clicking the top result away from the query flies the map about 1,100 km to a matching mesa landscape. The 25-second search wait is shortened in this recording.*
 
 ## Quick start: global Murray Lab index
 
