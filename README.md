@@ -20,6 +20,10 @@ Split out of the `mars_astrobio` monorepo in September 2026. Siblings:
 biosignature project this grew out of) and
 [backyard_worlds](https://github.com/davidackerman/backyard_worlds) (brown dwarf detection).
 
+![Drawing a box over the Proctor crater dune field and getting back similar dune fields across Mars](docs/images/proctor-dunes-search.webp)
+
+*A box drawn over the dune field in Proctor crater, searched against the zoom-8 patch index of the public Murray Lab CTX mosaic. The best matches are other dune fields, including Kaiser and Rabe craters. The 9-second search wait is shortened in this recording.*
+
 ## Quick start: global Murray Lab index
 
 ```bash
